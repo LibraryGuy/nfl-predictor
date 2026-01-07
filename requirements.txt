@@ -1,0 +1,6 @@
+streamlit
+nflreadpy
+pandas
+xgboost
+plotly
+numpy
