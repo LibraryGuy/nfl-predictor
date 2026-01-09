@@ -77,7 +77,6 @@ st.divider()
 p_yds, p_med, p_roll = get_prediction(data, selected_player, 'passing_yards', curr_temp, curr_wind, is_grass_val)
 s_yds, s_med, s_roll = get_prediction(data, selected_player, 'total_scrimmage_yards', curr_temp, curr_wind, is_grass_val)
 
-# ROW 1: PREDICTIONS & BETTING
 col1, col2, col3 = st.columns(3)
 with col1:
     if player_pos == 'QB':
@@ -105,7 +104,6 @@ with col3:
     st.metric("Vegas Line Edge", f"{edge_pct:.1f}%", delta=f"{edge:.1f} yds")
     st.caption(f"Vegas Line: {vegas_line}")
 
-# ROW 2: TD PROBABILITY
 st.divider()
 td_stat = 'passing_tds' if player_pos == 'QB' else 'total_scrimmage_tds'
 td_exp, _, _ = get_prediction(data, selected_player, td_stat, curr_temp, curr_wind, is_grass_val)
@@ -114,15 +112,15 @@ st.subheader(f"{'Passing' if player_pos == 'QB' else 'Anytime'} TD Probability")
 st.progress(min(prob/100, 1.0))
 st.write(f"Model Probability: **{prob:.1f}%**")
 
-# ROW 3: GRAPHS
 st.divider()
 g1, g2 = st.columns(2)
+player_data = data[data['player_name'] == selected_player]
 with g1:
     chart_stat = 'passing_yards' if player_pos == 'QB' else 'total_scrimmage_yards'
-    st.plotly_chart(px.line(data[data['player_name'] == selected_player], 
-                            x='week', y=[chart_stat, f'{chart_stat}_roll3'], 
+    st.plotly_chart(px.line(player_data, x='week', y=[chart_stat, f'{chart_stat}_roll3'], 
                             title=f"{selected_player} Yardage Velocity"), use_container_width=True)
 with g2:
-    st.plotly_chart(px.scatter(data[data['player_name'] == selected_player], 
-                               x='total_scrimmage_yards', y='total_scrimmage_tds', 
-                               trendline="ols", title="Efficiency: TDs per Yard"), use_container_width=True)
+    # Check if enough data points exist for a trendline
+    use_trend = "ols" if len(player_data) > 1 else None
+    st.plotly_chart(px.scatter(player_data, x='total_scrimmage_yards', y='total_scrimmage_tds', 
+                               trendline=use_trend, title="Efficiency: TDs per Yard"), use_container_width=True)
