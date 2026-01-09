@@ -2,7 +2,6 @@ streamlit
 nflreadpy
 pandas
 xgboost
-scikit-learn
 plotly
-numpy
+statsmodels
 scipy
