@@ -9,9 +9,10 @@ from scipy.stats import poisson
 st.set_page_config(page_title="NFL Sharp: Ultimate Prediction Engine", layout="wide")
 st.title("🏈 NFL Sharp: Ultimate Prediction Engine")
 
-@st.cache_data
+@st.cache_data(show_spinner="Fetching latest NFL data...")
 def load_nfl_data_pro():
     try:
+        # Define years - using 2024 as the primary stable base
         years = [2024, 2025]
         
         # 1. Load Datasets
@@ -19,21 +20,21 @@ def load_nfl_data_pro():
         pbp = nfl.load_pbp(seasons=years).to_pandas()
         sched = nfl.load_schedules(seasons=years).to_pandas()
         
-        # 2. Map IDs to prevent KeyErrors
+        # 2. Fix ID mapping to avoid KeyErrors
+        # Coalesce PBP IDs into a single 'player_id' to match weekly stats
         pbp['player_id'] = pbp['receiver_player_id'].fillna(
             pbp['rusher_player_id']).fillna(pbp['passer_player_id'])
         
-        # 3. Defensive Efficiency (EPA)
+        # 3. Efficiency & High-Value Usage
         def_epa = pbp.groupby(['season', 'week', 'defteam'])['epa'].mean().reset_index(name='def_epa_allowed')
         
-        # 4. Red Zone High-Value Touches
         rz_data = pbp[pbp['yardline_100'] <= 20].copy()
         rz_touches = rz_data.groupby(['season', 'week', 'player_id']).size().reset_index(name='rz_touches')
         
-        # 5. Merge Advanced Metrics
+        # 4. Merge Advanced Metrics into Weekly Stats
         weekly = weekly.merge(rz_touches, on=['season', 'week', 'player_id'], how='left').fillna(0)
         
-        # 6. Column Cleanup
+        # 5. Core Column Maintenance
         if 'recent_team' not in weekly.columns:
             if 'team' in weekly.columns: weekly = weekly.rename(columns={'team': 'recent_team'})
             elif 'team_abbr' in weekly.columns: weekly = weekly.rename(columns={'team_abbr': 'recent_team'})
@@ -45,13 +46,13 @@ def load_nfl_data_pro():
         weekly['total_scrimmage_yards'] = weekly['rushing_yards'] + weekly['receiving_yards']
         weekly['total_scrimmage_tds'] = weekly['rushing_tds'] + weekly['receiving_tds']
         
-        # 7. Rolling Features
+        # 6. Heat-Check (Rolling Averages)
         weekly = weekly.sort_values(['player_name', 'season', 'week'])
         roll_cols = ['passing_yards', 'total_scrimmage_yards', 'rz_touches', 'passing_tds', 'total_scrimmage_tds']
         for col in roll_cols:
             weekly[f'{col}_roll3'] = weekly.groupby('player_name')[col].transform(lambda x: x.rolling(3, 1).mean())
         
-        # 8. Merge Schedules & Environment
+        # 7. Merge Environmental & Opponent Factors
         df = weekly.merge(sched[['season', 'week', 'home_team', 'temp', 'wind', 'surface']], 
                           left_on=['season', 'week', 'recent_team'], 
                           right_on=['season', 'week', 'home_team'], how='left')
@@ -59,18 +60,21 @@ def load_nfl_data_pro():
         df = df.merge(def_epa, left_on=['season', 'week', 'opponent_team'], 
                       right_on=['season', 'week', 'defteam'], how='left')
         
-        df[['wind', 'def_epa_allowed']] = df[['wind', 'def_epa_allowed']].fillna(0)
+        df[['wind', 'def_epa_allowed', 'temp']] = df[['wind', 'def_epa_allowed', 'temp']].fillna(0)
         df['is_grass'] = df['surface'].apply(lambda x: 1 if str(x).lower() == 'grass' else 0)
         
-        return df # Ensure the dataframe is returned here
+        return df # CRITICAL: This return was likely missing or mis-indented
+        
     except Exception as e:
-        st.error(f"Data Load Error: {e}")
-        return pd.DataFrame() # Return empty df instead of None
+        st.error(f"Error initializing data: {e}")
+        # Return an empty dataframe with the required columns as a fallback
+        return pd.DataFrame(columns=['player_name', 'position', 'passing_yards', 'total_scrimmage_yards'])
 
+# Load the data
 data = load_nfl_data_pro()
 
-# Safety Check: Prevent TypeError by ensuring data is not empty
-if not data.empty:
+# --- APP LOGIC GUARD ---
+if data is not None and not data.empty:
     # --- SIDEBAR: GAME CONTROLS ---
     st.sidebar.header("Game Environment")
     curr_wind = st.sidebar.slider("Wind Speed (MPH)", 0, 40, 5)
@@ -85,11 +89,13 @@ if not data.empty:
     # --- PREDICTION ENGINE ---
     def get_prediction(df, player_name, target_stat, temp, wind, is_grass):
         p_data = df[df['player_name'] == player_name].copy()
-        if len(p_data) < 3: return 0.0, 0.0, 0.0
+        if len(p_data) < 2: return 0.0, 0.0, 0.0
         
         features = ['temp', 'wind', 'is_grass', 'rz_touches_roll3', 'def_epa_allowed']
         X = p_data[features].fillna(0)
-        model = XGBRegressor(n_estimators=50).fit(X, p_data[target_stat])
+        y = p_data[target_stat]
+        
+        model = XGBRegressor(n_estimators=50).fit(X, y)
         
         avg_def_epa = df[df['player_name']==player_name]['def_epa_allowed'].mean()
         input_df = pd.DataFrame([[temp, wind, is_grass, p_data['rz_touches_roll3'].iloc[-1], avg_def_epa]], 
@@ -143,7 +149,7 @@ if not data.empty:
             pos = data[data['player_name'] == p]['position'].iloc[-1]
             stat = 'passing_tds' if pos == 'QB' else 'total_scrimmage_tds'
             exp, _, _ = get_prediction(data, p, stat, curr_temp, curr_wind, is_grass_val)
-            hit_prob = (1 - poisson.pmf(0, exp))
+            hit_prob = (1 - poisson.pmf(0, exp if exp > 0 else 0.1))
             probs.append(hit_prob)
             ticket_rows.append({"Player": p, "Market": "Passing TD" if pos == 'QB' else "Anytime TD", "Prob": f"{hit_prob*100:.1f}%"})
         
@@ -152,4 +158,4 @@ if not data.empty:
         st.metric("Ticket Hit Probability", f"{total_prob:.2f}%")
         st.progress(min(total_prob/100, 1.0))
 else:
-    st.warning("The NFL data failed to initialize. Please check your internet connection or try refreshing the page.")
+    st.warning("No data found for the 2024-2025 seasons. Please check your internet connection and refresh.")
