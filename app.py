@@ -18,21 +18,22 @@ def load_nfl_data_pro():
     pbp = nfl.load_pbp(seasons=years).to_pandas()
     sched = nfl.load_schedules(seasons=years).to_pandas()
     
-    # 2. Fix the ID KeyError (Coalesce PBP IDs)
-    # This combines potential ball-carriers into a single ID for merging
-    pbp['fantasy_player_id'] = pbp['receiver_player_id'].fillna(
+    # 2. Robust ID Mapping (Fixing the KeyError)
+    # PBP uses specific IDs; we coalesce them into a single 'player_id' to match weekly stats
+    pbp['player_id'] = pbp['receiver_player_id'].fillna(
         pbp['rusher_player_id']).fillna(pbp['passer_player_id'])
     
     # 3. Efficiency & High-Value Usage
-    # Extract Team Defense EPA (Opponent Difficulty)
+    # Team Defense EPA (Opponent Difficulty)
     def_epa = pbp.groupby(['season', 'week', 'defteam'])['epa'].mean().reset_index(name='def_epa_allowed')
     
-    # Extract Red Zone Touches (Inside the 20)
+    # Red Zone Touches (Plays inside the 20-yard line)
     rz_data = pbp[pbp['yardline_100'] <= 20].copy()
-    rz_touches = rz_data.groupby(['season', 'week', 'fantasy_player_id']).size().reset_index(name='rz_touches')
+    rz_touches = rz_data.groupby(['season', 'week', 'player_id']).size().reset_index(name='rz_touches')
     
     # 4. Merge Advanced Metrics into Weekly Stats
-    weekly = weekly.merge(rz_touches, on=['season', 'week', 'fantasy_player_id'], how='left').fillna(0)
+    # 'player_id' is the standard key in load_player_stats()
+    weekly = weekly.merge(rz_touches, on=['season', 'week', 'player_id'], how='left').fillna(0)
     
     # 5. Core Column Maintenance
     if 'recent_team' not in weekly.columns:
@@ -86,7 +87,6 @@ def get_prediction(df, player_name, target_stat, temp, wind, is_grass):
     X = p_data[features].fillna(0)
     model = XGBRegressor(n_estimators=50).fit(X, p_data[target_stat])
     
-    # Calculate player's typical opponent strength for the scenario
     avg_def_epa = df[df['player_name']==player_name]['def_epa_allowed'].mean()
     input_df = pd.DataFrame([[temp, wind, is_grass, p_data['rz_touches_roll3'].iloc[-1], avg_def_epa]], 
                              columns=features)
@@ -100,9 +100,10 @@ s_yds, s_med, s_roll = get_prediction(data, selected_player, 'total_scrimmage_ya
 
 c1, c2, c3 = st.columns(3)
 with c1:
-    rec_val = int((p_yds if player_pos == 'QB' else s_yds) * 0.85 / 5) * 5
+    main_val = p_yds if player_pos == 'QB' else s_yds
+    rec_val = int(main_val * 0.85 / 5) * 5
     st.success(f"🎯 RECOMMENDED LEG: {rec_val}+ {'Pass' if player_pos=='QB' else 'Scrim'} Yds")
-    st.metric("Model Proj.", f"{p_yds if player_pos=='QB' else s_yds:.1f}")
+    st.metric("Model Proj.", f"{main_val:.1f}")
 
 with c2:
     if p_roll > p_med * 1.5 or s_roll > s_med * 1.5:
