@@ -7,7 +7,7 @@ import numpy as np
 from scipy.stats import poisson
 
 st.set_page_config(page_title="NFL Sharp Pro Predictor", layout="wide")
-st.title("🏈 NFL Sharp: Full Usage, Fades & Position Analytics")
+st.title("🏈 NFL Sharp: Analytics & Parlay Builder")
 
 @st.cache_data
 def load_nfl_data_pro():
@@ -28,7 +28,6 @@ def load_nfl_data_pro():
     
     team_tgts = weekly.groupby(['recent_team', 'season', 'week'])['targets'].transform('sum')
     weekly['target_share'] = (weekly['targets'] / team_tgts).fillna(0)
-    weekly['xtd'] = weekly['total_scrimmage_yards'] / 150
     
     weekly = weekly.sort_values(['player_name', 'season', 'week'])
     roll_cols = ['passing_yards', 'total_scrimmage_yards', 'target_share', 'passing_tds', 'total_scrimmage_tds']
@@ -53,11 +52,11 @@ curr_temp = st.sidebar.slider("Temperature (F)", 0, 100, 65)
 is_grass_val = 1 if st.sidebar.radio("Field Type", ["Grass", "Turf"]) == "Grass" else 0
 
 player_list = sorted(data['player_name'].unique())
-selected_player = st.selectbox("Select Player", player_list)
+selected_player = st.selectbox("Select Player for Detailed View", player_list)
 selected_opp = st.selectbox("Select Opponent", sorted(data['opponent_team'].unique()))
 
 player_pos = data[data['player_name'] == selected_player]['position'].iloc[-1]
-vegas_line = st.sidebar.number_input("Enter Sportsbook Line", value=225.5 if player_pos == 'QB' else 65.5)
+vegas_line = st.sidebar.number_input("Enter Sportsbook Line for Main View", value=225.5 if player_pos == 'QB' else 65.5)
 
 # --- ENGINE ---
 def get_prediction(df, player_name, target_stat, temp, wind, is_grass):
@@ -65,14 +64,11 @@ def get_prediction(df, player_name, target_stat, temp, wind, is_grass):
     if len(p_data) < 3: return 0.0, 0.0, 0.0
     X = p_data[['temp', 'wind', 'is_grass', 'target_share_roll3']].fillna(0)
     model = XGBRegressor(n_estimators=45).fit(X, p_data[target_stat])
-    
-    latest_usage = p_data['target_share_roll3'].iloc[-1]
-    input_df = pd.DataFrame([[temp, wind, is_grass, latest_usage]], 
+    input_df = pd.DataFrame([[temp, wind, is_grass, p_data['target_share_roll3'].iloc[-1]]], 
                              columns=['temp', 'wind', 'is_grass', 'target_share_roll3'])
-    
     return max(0, model.predict(input_df)[0]), p_data[target_stat].median(), p_data[f'{target_stat}_roll3'].iloc[-1]
 
-# --- DASHBOARD ---
+# --- DASHBOARD: MAIN VIEW ---
 st.divider()
 p_yds, p_med, p_roll = get_prediction(data, selected_player, 'passing_yards', curr_temp, curr_wind, is_grass_val)
 s_yds, s_med, s_roll = get_prediction(data, selected_player, 'total_scrimmage_yards', curr_temp, curr_wind, is_grass_val)
@@ -82,45 +78,64 @@ with col1:
     if player_pos == 'QB':
         rec_val = int(p_yds * 0.85 / 5) * 5
         st.success(f"🎯 RECOMMENDED LEG: {rec_val}+ Passing Yds")
-        st.metric("Proj. Passing", f"{p_yds:.1f}", delta=f"{p_yds - p_roll:.1f} vs L3")
     else:
         rec_val = int(s_yds * 0.8 / 5) * 5
         st.success(f"🎯 RECOMMENDED LEG: {rec_val}+ Scrimmage Yds")
-        st.metric("Proj. Scrimmage", f"{s_yds:.1f}", delta=f"{s_yds - s_roll:.1f} vs L3")
+    st.metric("Proj. Value", f"{p_yds if player_pos == 'QB' else s_yds:.1f}")
 
 with col2:
     main_roll = p_roll if player_pos == 'QB' else s_roll
     main_med = p_med if player_pos == 'QB' else s_med
     if main_roll > main_med * 1.5 or (curr_wind > 18 and player_pos != 'RB'):
         st.error(f"⚠️ FADE ALERT: Avoid 'Over'")
-        st.caption("Reason: High Variance/Wind Detected")
     else:
         st.warning("⚖️ NEUTRAL: No strong Fade signals.")
 
 with col3:
     compare_val = p_yds if player_pos == 'QB' else s_yds
     edge = compare_val - vegas_line
-    edge_pct = (edge / vegas_line) * 100
-    st.metric("Vegas Line Edge", f"{edge_pct:.1f}%", delta=f"{edge:.1f} yds")
-    st.caption(f"Vegas Line: {vegas_line}")
+    st.metric("Vegas Line Edge", f"{(edge/vegas_line)*100:.1f}%", delta=f"{edge:.1f} yds")
 
-st.divider()
-td_stat = 'passing_tds' if player_pos == 'QB' else 'total_scrimmage_tds'
-td_exp, _, _ = get_prediction(data, selected_player, td_stat, curr_temp, curr_wind, is_grass_val)
-prob = (1 - poisson.pmf(0, td_exp)) * 100
-st.subheader(f"{'Passing' if player_pos == 'QB' else 'Anytime'} TD Probability")
-st.progress(min(prob/100, 1.0))
-st.write(f"Model Probability: **{prob:.1f}%**")
-
+# Visuals
 st.divider()
 g1, g2 = st.columns(2)
 player_data = data[data['player_name'] == selected_player]
 with g1:
     chart_stat = 'passing_yards' if player_pos == 'QB' else 'total_scrimmage_yards'
-    st.plotly_chart(px.line(player_data, x='week', y=[chart_stat, f'{chart_stat}_roll3'], 
-                            title=f"{selected_player} Yardage Velocity"), use_container_width=True)
+    st.plotly_chart(px.line(player_data, x='week', y=[chart_stat, f'{chart_stat}_roll3'], title="Velocity"), use_container_width=True)
 with g2:
-    # Check if enough data points exist for a trendline
-    use_trend = "ols" if len(player_data) > 1 else None
-    st.plotly_chart(px.scatter(player_data, x='total_scrimmage_yards', y='total_scrimmage_tds', 
-                               trendline=use_trend, title="Efficiency: TDs per Yard"), use_container_width=True)
+    st.plotly_chart(px.scatter(player_data, x='total_scrimmage_yards', y='total_scrimmage_tds', trendline="ols", title="Efficiency"), use_container_width=True)
+
+# --- NEW: PARLAY BUILDER ---
+st.divider()
+st.header("🎟️ Parlay Builder")
+st.subheader("Select multiple TD scorers to see the probability of a combined hit.")
+
+parlay_players = st.multiselect("Add Scorers to Ticket", player_list, default=[selected_player])
+
+if parlay_players:
+    probs = []
+    ticket_data = []
+    
+    for p in parlay_players:
+        pos = data[data['player_name'] == p]['position'].iloc[-1]
+        stat = 'passing_tds' if pos == 'QB' else 'total_scrimmage_tds'
+        exp, _, _ = get_prediction(data, p, stat, curr_temp, curr_wind, is_grass_val)
+        
+        # P(at least 1 TD) = 1 - P(zero TDs)
+        hit_prob = (1 - poisson.pmf(0, exp))
+        probs.append(hit_prob)
+        ticket_data.append({"Player": p, "Type": "Passing TD" if pos == 'QB' else "Anytime TD", "Prob": f"{hit_prob*100:.1f}%"})
+    
+    # Combined Prob: P(A and B and C) = P(A)*P(B)*P(C)
+    total_prob = np.prod(probs) * 100
+    
+    # Display Ticket
+    st.table(pd.DataFrame(ticket_data))
+    
+    c_p1, c_p2 = st.columns(2)
+    c_p1.metric("Parlay Win Probability", f"{total_prob:.2f}%")
+    c_p2.metric("Fair Value Odds (Decimal)", f"{100/total_prob:.2f}" if total_prob > 0 else "0.00")
+    
+    st.progress(min(total_prob/100, 1.0))
+    st.caption("Note: Probability calculation assumes independence between player scoring events.")
