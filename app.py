@@ -8,7 +8,7 @@ from scipy.stats import poisson
 
 # Set page layout
 st.set_page_config(page_title="NFL Pro Predictor", layout="wide")
-st.title("🏈 NFL Pro Analytics: Usage, Efficiency & TD Probability")
+st.title("🏈 NFL Pro Analytics: Usage, Heat-Checks & Betting Legs")
 
 @st.cache_data
 def load_nfl_data_pro():
@@ -36,9 +36,9 @@ def load_nfl_data_pro():
     # Advanced Usage: Target Share & Proxy WOPR
     team_tgts = weekly.groupby(['recent_team', 'season', 'week'])['targets'].transform('sum')
     weekly['target_share'] = (weekly['targets'] / team_tgts).fillna(0)
-    weekly['wopr'] = weekly['target_share'] * 2.0  # Simplified WOPR proxy
+    weekly['wopr'] = weekly['target_share'] * 2.0  
     
-    # 4. Rolling 3-game averages (The "Heat-Check" logic)
+    # 4. Rolling 3-game averages (Heat-Check logic)
     weekly = weekly.sort_values(['player_name', 'season', 'week'])
     roll_cols = ['passing_yards', 'total_scrimmage_yards', 'passing_tds', 'total_scrimmage_tds', 'target_share']
     for col in roll_cols:
@@ -69,7 +69,7 @@ curr_temp = st.sidebar.slider("Temperature", 0, 100, 65)
 is_grass_val = 1 if st.sidebar.radio("Field Type", ["Grass", "Turf"]) == "Grass" else 0
 
 player_list = sorted(data['player_name'].unique())
-selected_player = st.selectbox("Select Player", player_list, index=player_list.index("B.Young") if "B.Young" in player_list else 0)
+selected_player = st.selectbox("Select Player", player_list, index=0)
 selected_opp = st.selectbox("Select Opponent", sorted(data['opponent_team'].unique()))
 
 # --- PREDICTION ENGINE ---
@@ -77,13 +77,11 @@ def get_pro_prediction(df, player_name, target_stat, opponent, temp, wind, is_gr
     p_data = df[df['player_name'] == player_name].copy()
     if len(p_data) < 3: return 0.0, 0.0, 0.0
     
-    # Train model on features including recent target share
     X = p_data[['temp', 'wind', 'is_grass', 'target_share_roll3']].fillna(0)
     y = p_data[target_stat]
     
     model = XGBRegressor(n_estimators=45).fit(X, y)
     
-    # Current input for prediction
     latest_roll = p_data[f'{target_stat}_roll3'].iloc[-1]
     curr_target_roll = p_data['target_share_roll3'].iloc[-1]
     
@@ -96,38 +94,47 @@ def calc_td_prob(expected_tds):
     prob = (1 - poisson.pmf(0, expected_tds)) * 100
     return min(99.9, max(0.1, prob))
 
-# --- DASHBOARD DISPLAY ---
+# --- DASHBOARD LAYOUT ---
 st.divider()
+p_yds, p_avg, p_roll = get_pro_prediction(data, selected_player, 'passing_yards', selected_opp, curr_temp, curr_wind, is_grass_val)
+s_yds, s_avg, s_roll = get_pro_prediction(data, selected_player, 'total_scrimmage_yards', selected_opp, curr_temp, curr_wind, is_grass_val)
+s_td, _, _ = get_pro_prediction(data, selected_player, 'total_scrimmage_tds', selected_opp, curr_temp, curr_wind, is_grass_val)
+
 col_p, col_s = st.columns(2)
 
 with col_p:
     st.subheader("🎯 Passing Analytics")
-    p_yds, p_avg, p_roll = get_pro_prediction(data, selected_player, 'passing_yards', selected_opp, curr_temp, curr_wind, is_grass_val)
-    p_td, _, _ = get_pro_prediction(data, selected_player, 'passing_tds', selected_opp, curr_temp, curr_wind, is_grass_val)
-    
     st.metric("Proj. Passing Yards", f"{p_yds:.1f}", delta=f"{p_yds - p_roll:.1f} vs L3 Avg")
     st.write(f"**Last 3 Games Avg:** {p_roll:.1f} yards")
-    st.metric("Passing TD Probability", f"{calc_td_prob(p_td):.1f}%")
+    
+    # BETTING LEG: Passing
+    p_leg = int(p_yds * 0.85 / 5) * 5 # Conservative 85% floor rounded to nearest 5
+    st.success(f"✅ Suggested Betting Leg: {p_leg}+ Passing Yards")
 
 with col_s:
     st.subheader("🏃 Scrimmage Analytics")
-    s_yds, s_avg, s_roll = get_pro_prediction(data, selected_player, 'total_scrimmage_yards', selected_opp, curr_temp, curr_wind, is_grass_val)
-    s_td, _, _ = get_pro_prediction(data, selected_player, 'total_scrimmage_tds', selected_opp, curr_temp, curr_wind, is_grass_val)
-    
     st.metric("Proj. Scrimmage Yards", f"{s_yds:.1f}", delta=f"{s_yds - s_roll:.1f} vs L3 Avg")
     st.write(f"**Last 3 Games Avg:** {s_roll:.1f} yards")
-    st.metric("Anytime TD Probability", f"{calc_td_prob(s_td):.1f}%")
+    
+    # BETTING LEG: Scrimmage
+    s_leg = int(s_yds * 0.80 / 5) * 5 # Conservative 80% floor rounded to nearest 5
+    st.success(f"✅ Suggested Betting Leg: {s_leg}+ Scrimmage Yards")
+
+# TD Probability Section
+st.divider()
+st.subheader(f"🏟️ {selected_player} Scoring Outlook vs {selected_opp}")
+prob = calc_td_prob(s_td)
+st.progress(prob / 100)
+st.write(f"**Anytime TD Probability:** {prob:.1f}%")
 
 # --- HISTORICAL CHARTS ---
 st.divider()
-chart_col1, chart_col2 = st.columns(2)
-
-with chart_col1:
+c1, c2 = st.columns(2)
+with c1:
     st.plotly_chart(px.line(data[data['player_name'] == selected_player], 
                             x='week', y=['total_scrimmage_yards', 'total_scrimmage_yards_roll3'], 
                             title="Yardage Trend: Raw vs Heat-Check"), use_container_width=True)
-
-with chart_col2:
+with c2:
     td_cols = ['passing_tds', 'rushing_tds', 'receiving_tds']
     st.plotly_chart(px.bar(data[data['player_name'] == selected_player], 
                            x='week', y=td_cols, 
