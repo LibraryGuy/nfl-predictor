@@ -7,8 +7,8 @@ import numpy as np
 from scipy.stats import poisson
 
 # Set page layout
-st.set_page_config(page_title="NFL Predictor: TD Pro", layout="wide")
-st.title("🏈 NFL Predictive Dashboard: Heat-Check & TD Tracker")
+st.set_page_config(page_title="NFL Predictor: Heat-Check Pro", layout="wide")
+st.title("🏈 NFL Predictor: Yards, TDs & Rolling Trends")
 
 @st.cache_data
 def load_nfl_data_pro():
@@ -85,20 +85,25 @@ def calc_td_prob(expected_tds):
 # --- DASHBOARD LAYOUT ---
 st.divider()
 col_p, col_s = st.columns(2)
-p_pos = data[data['player_name'] == selected_player]['position'].iloc[0]
 
 with col_p:
     st.subheader("🎯 Passing Analytics")
     p_yds, p_avg, p_roll = get_advanced_prediction(data, selected_player, 'passing_yards', selected_opp, curr_temp, is_grass_val)
     p_td, _, _ = get_advanced_prediction(data, selected_player, 'passing_tds', selected_opp, curr_temp, is_grass_val)
-    st.metric("Proj. Passing Yards", f"{p_yds:.1f}", delta=f"{p_yds - p_roll:.1f} vs Heat-Check")
+    
+    # DISPLAY: Prediction with Delta vs Rolling Avg
+    st.metric("Proj. Passing Yards", f"{p_yds:.1f}", delta=f"{p_yds - p_roll:.1f} vs L3 Avg")
+    st.write(f"**Last 3 Games Avg:** {p_roll:.1f} yards")
     st.metric("Passing TD Probability", f"{calc_td_prob(p_td):.1f}%")
 
 with col_s:
     st.subheader("🏃 Scrimmage Analytics")
     s_yds, s_avg, s_roll = get_advanced_prediction(data, selected_player, 'total_scrimmage_yards', selected_opp, curr_temp, is_grass_val)
     s_td, _, _ = get_advanced_prediction(data, selected_player, 'total_scrimmage_tds', selected_opp, curr_temp, is_grass_val)
-    st.metric("Proj. Scrimmage Yards", f"{s_yds:.1f}", delta=f"{s_yds - s_roll:.1f} vs Heat-Check")
+    
+    # DISPLAY: Prediction with Delta vs Rolling Avg
+    st.metric("Proj. Scrimmage Yards", f"{s_yds:.1f}", delta=f"{s_yds - s_roll:.1f} vs L3 Avg")
+    st.write(f"**Last 3 Games Avg:** {s_roll:.1f} yards")
     st.metric("Anytime TD Probability", f"{calc_td_prob(s_td):.1f}%")
 
 # --- HISTORICAL CHARTS ---
@@ -108,17 +113,11 @@ chart_col1, chart_col2 = st.columns(2)
 with chart_col1:
     st.plotly_chart(px.line(data[data['player_name'] == selected_player], 
                             x='week', y=['total_scrimmage_yards', 'total_scrimmage_yards_roll3'], 
-                            title="Yardage Trend: Raw vs Heat-Check"), use_container_width=True)
+                            title="Yardage Trend: Raw vs Heat-Check (Rolling 3)"), use_container_width=True)
 
 with chart_col2:
-    # Touchdown Stacked Bar Chart
     td_cols = ['passing_tds', 'rushing_tds', 'receiving_tds']
     st.plotly_chart(px.bar(data[data['player_name'] == selected_player], 
                            x='week', y=td_cols, 
                            title="Historical TD Log (Stacked by Type)",
-                           labels={"value": "Touchdowns", "variable": "Type"},
-                           color_discrete_map={
-                               "passing_tds": "#1f77b4", 
-                               "rushing_tds": "#2ca02c", 
-                               "receiving_tds": "#ff7f0e"
-                           }), use_container_width=True)
+                           labels={"value": "Touchdowns", "variable": "Type"}), use_container_width=True)
