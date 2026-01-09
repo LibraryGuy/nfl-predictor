@@ -7,8 +7,8 @@ import numpy as np
 from scipy.stats import poisson
 
 # Set page layout
-st.set_page_config(page_title="NFL Predictor: TD Projections", layout="wide")
-st.title("🏈 NFL Predictive Dashboard: Yards & TD Probability")
+st.set_page_config(page_title="NFL Predictor: Heat-Check Edition", layout="wide")
+st.title("🏈 NFL Predictive Dashboard: Heat-Check & TD Odds")
 
 @st.cache_data
 def load_nfl_data_pro():
@@ -26,6 +26,18 @@ def load_nfl_data_pro():
     weekly['total_scrimmage_yards'] = weekly['rushing_yards'] + weekly['receiving_yards']
     weekly['total_scrimmage_tds'] = weekly['rushing_tds'] + weekly['receiving_tds']
     
+    # --- ROLLING AVERAGE LOGIC ---
+    # Sort by player and time to ensure rolling is chronological
+    weekly = weekly.sort_values(['player_name', 'season', 'week'])
+    
+    # Define targets for rolling averages
+    rolling_targets = ['passing_yards', 'total_scrimmage_yards', 'passing_tds', 'total_scrimmage_tds']
+    for col in rolling_targets:
+        weekly[f'{col}_roll3'] = weekly.groupby('player_name')[col].transform(
+            lambda x: x.rolling(window=3, min_periods=1).mean()
+        )
+    
+    # Merge Schedule
     df = weekly.merge(
         sched[['season', 'week', 'home_team', 'temp', 'surface']], 
         left_on=['season', 'week', 'recent_team'], 
@@ -48,8 +60,9 @@ player_list = sorted(data['player_name'].dropna().unique())
 selected_player = st.selectbox("Select Player", player_list, index=player_list.index("B.Young") if "B.Young" in player_list else 0)
 selected_opp = st.selectbox("Select Opponent", sorted(data['opponent_team'].unique()))
 
-# --- PREDICTION ENGINE ---
+# --- PREDICTION ENGINE (UPDATED WITH ROLLING STATS) ---
 def get_advanced_prediction(df, player_name, target_stat, opponent, temp, is_grass):
+    # Defense Difficulty
     def_avg = data.groupby('opponent_team')[target_stat].mean().reset_index()
     def_avg.columns = ['opponent_team', 'def_diff']
     opp_val = def_avg[def_avg['opponent_team'] == opponent]['def_diff'].iloc[0]
@@ -57,57 +70,52 @@ def get_advanced_prediction(df, player_name, target_stat, opponent, temp, is_gra
     p_data = df[df['player_name'] == player_name].copy()
     p_data = p_data.merge(def_avg, on='opponent_team', how='left')
     
-    if len(p_data) < 3: return 0.0, 0.0
+    if len(p_data) < 3: return 0.0, 0.0, 0.0
     
-    X = p_data[['temp', 'is_grass', 'def_diff']].fillna(0)
+    # Feature set includes the 3-game rolling average
+    roll_col = f'{target_stat}_roll3'
+    X = p_data[['temp', 'is_grass', 'def_diff', roll_col]].fillna(0)
     y = p_data[target_stat]
+    
     model = XGBRegressor(n_estimators=40).fit(X, y)
-    pred = model.predict(pd.DataFrame([[temp, is_grass, opp_val]], columns=['temp', 'is_grass', 'def_diff']))[0]
-    return max(0, pred), p_data[target_stat].mean()
+    
+    # Predict using the player's LATEST rolling average
+    latest_roll = p_data[roll_col].iloc[-1]
+    pred = model.predict(pd.DataFrame([[temp, is_grass, opp_val, latest_roll]], 
+                                       columns=['temp', 'is_grass', 'def_diff', roll_col]))[0]
+    
+    return max(0, pred), p_data[target_stat].mean(), latest_roll
 
-# --- CALCULATING TD PROBABILITY ---
 def calc_td_prob(expected_tds):
-    # Poisson probability of 1 or more TDs: 1 - P(0)
     prob = (1 - poisson.pmf(0, expected_tds)) * 100
     return min(99.9, max(0.1, prob))
 
-# --- DISPLAY ---
-p_pos = data[data['player_name'] == selected_player]['position'].iloc[0]
+# --- DASHBOARD LAYOUT ---
 st.divider()
-
 col_p, col_s = st.columns(2)
 
+# PASSING SECTION
 with col_p:
-    st.subheader("🎯 Passing & Scoring")
-    p_yds, p_avg = get_advanced_prediction(data, selected_player, 'passing_yards', selected_opp, curr_temp, is_grass_val)
-    p_td, _ = get_advanced_prediction(data, selected_player, 'passing_tds', selected_opp, curr_temp, is_grass_val)
+    st.subheader("🎯 Passing Analytics")
+    p_yds, p_avg, p_roll = get_advanced_prediction(data, selected_player, 'passing_yards', selected_opp, curr_temp, is_grass_val)
+    p_td, _, _ = get_advanced_prediction(data, selected_player, 'passing_tds', selected_opp, curr_temp, is_grass_val)
     
-    st.metric("Proj. Passing Yards", f"{p_yds:.1f}")
-    st.metric("Passing TD Probability", f"{calc_td_prob(p_td):.1f}%", help="Chance of throwing 1+ TDs")
+    st.metric("Proj. Passing Yards", f"{p_yds:.1f}", delta=f"{p_yds - p_roll:.1f} vs Heat-Check")
+    st.write(f"**Season Avg:** {p_avg:.1f} | **Last 3 Games:** {p_roll:.1f}")
+    st.metric("Passing TD Probability", f"{calc_td_prob(p_td):.1f}%")
 
+# SCRIMMAGE SECTION
 with col_s:
-    st.subheader("🏃 Scrimmage & Scoring")
-    s_yds, s_avg = get_advanced_prediction(data, selected_player, 'total_scrimmage_yards', selected_opp, curr_temp, is_grass_val)
-    s_td, _ = get_advanced_prediction(data, selected_player, 'total_scrimmage_tds', selected_opp, curr_temp, is_grass_val)
+    st.subheader("🏃 Scrimmage Analytics")
+    s_yds, s_avg, s_roll = get_advanced_prediction(data, selected_player, 'total_scrimmage_yards', selected_opp, curr_temp, is_grass_val)
+    s_td, _, _ = get_advanced_prediction(data, selected_player, 'total_scrimmage_tds', selected_opp, curr_temp, is_grass_val)
     
-    st.metric("Proj. Scrimmage Yards", f"{s_yds:.1f}")
-    st.metric("Anytime TD Probability", f"{calc_td_prob(s_td):.1f}%", help="Chance of scoring 1+ Rush/Rec TDs")
+    st.metric("Proj. Scrimmage Yards", f"{s_yds:.1f}", delta=f"{s_yds - s_roll:.1f} vs Heat-Check")
+    st.write(f"**Season Avg:** {s_avg:.1f} | **Last 3 Games:** {s_roll:.1f}")
+    st.metric("Anytime TD Probability", f"{calc_td_prob(s_td):.1f}%")
 
-# --- BETTING ADVICE ---
+# --- HISTORICAL CHART ---
 st.divider()
-st.subheader("🤑 Recommended Betting Slip")
-rec_col1, rec_col2 = st.columns(2)
-
-with rec_col1:
-    main_yds = p_yds if p_pos == 'QB' else s_yds
-    label = "Passing" if p_pos == 'QB' else "Scrimmage"
-    st.info(f"**Yards Leg:** {selected_player} OVER {int(main_yds * 0.88)}.5 {label} Yards")
-
-with rec_col2:
-    atd_prob = calc_td_prob(s_td)
-    if atd_prob > 45:
-        st.success(f"**TD Leg:** {selected_player} Anytime TD (High Confidence: {atd_prob:.1f}%)")
-    else:
-        st.warning(f"**TD Leg:** Avoid ATD (Low Confidence: {atd_prob:.1f}%)")
-
-st.plotly_chart(px.bar(data[data['player_name'] == selected_player], x='week', y=['rushing_tds', 'receiving_tds', 'passing_tds'], title="Historical Scoring Log"))
+st.plotly_chart(px.line(data[data['player_name'] == selected_player], 
+                        x='week', y=['total_scrimmage_yards', 'total_scrimmage_yards_roll3'], 
+                        title="Scrimmage Yards: Raw vs. 3-Game Trend (Heat Check)"), use_container_width=True)
