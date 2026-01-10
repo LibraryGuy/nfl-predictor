@@ -152,3 +152,34 @@ if parlay_players:
     total_prob = np.prod(probs) * 100
     st.metric("Parlay Win Probability", f"{total_prob:.2f}%")
     st.progress(min(total_prob/100, 1.0))
+
+# --- HISTORICAL MATCHUP TABLE ---
+st.divider()
+st.subheader(f"🏟️ {selected_player} Career vs {selected_opp}")
+
+# 1. Filter data for the specific matchup
+matchup_history = player_subset[player_subset['opponent_team'] == selected_opp].copy()
+
+# 2. Safety Check: Only show if they have actually played each other
+if not matchup_history.empty:
+    # Select and rename columns for a clean look
+    display_cols = ['season', 'week', target_stat, 'total_scrimmage_tds', 'temp', 'wind']
+    history_table = matchup_history[display_cols].sort_values('season', ascending=False)
+    
+    # Format the table for readability
+    st.dataframe(
+        history_table,
+        column_config={
+            "season": "Year",
+            "week": "Wk",
+            target_stat: "Yards",
+            "total_scrimmage_tds": "TDs",
+            "temp": "Temp",
+            "wind": "Wind"
+        },
+        hide_index=True,
+        use_container_width=True
+    )
+else:
+    # 3. Graceful Fallback (Prevents NoneType Error)
+    st.info(f"No previous career games found for {selected_player} against the {selected_opp}.")
