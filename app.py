@@ -5,6 +5,21 @@ from xgboost import XGBRegressor
 import plotly.express as px
 import numpy as np
 from scipy.stats import poisson
+from st_paywall import add_auth  # <--- Add this import
+
+# 1. THE PAYWALL GATE
+# This MUST be called before any of your other app code.
+# It will automatically show a "Login with Google" or "Subscribe" button.
+add_auth(
+    required=True,
+    subscription_button_text="Get Pro Insights",
+    button_color="#FF4B4B"
+)
+
+# 2. YOUR ORIGINAL APP CODE (Everything else stays the same)
+import nflreadpy as nfl
+import pandas as pd
+# ... (the rest of your working code)
 
 # 1. PAGE SETUP
 st.set_page_config(page_title="NFL Sharp Pro Predictor", layout="wide")
@@ -183,3 +198,4 @@ if not matchup_history.empty:
 else:
     # 3. Graceful Fallback (Prevents NoneType Error)
     st.info(f"No previous career games found for {selected_player} against the {selected_opp}.")
+
