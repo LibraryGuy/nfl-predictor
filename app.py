@@ -5,40 +5,34 @@ import pandas as pd
 from xgboost import XGBRegressor
 import plotly.express as px
 import numpy as np
+# Optional: Adding this import explicitly can help debug env issues
+import sklearn 
 
-# --- 1. NATIVE AUTHENTICATION GATE ---
-# This ensures the user is logged in via Google first.
+# --- 1. AUTHENTICATION GATE ---
 if not st.user.is_logged_in:
     st.set_page_config(page_title="NFL Sharp - Login", page_icon="🏈")
     st.title("🏈 NFL Sharp: Pro Predictor")
-    st.markdown("### Secure Member Login")
-    st.info("Please log in with your Google account to access analytics.")
-    
+    st.info("Please log in with Google to access the dashboard.")
     st.button("Log in with Google", on_click=st.login, type="primary")
     st.stop()
 
-# --- 2. WHITELIST & PAYWALL LOGIC ---
-# Define who gets in for free. 
-# It's best to pull this from secrets, but you can hardcode it here too.
+# --- 2. WHITELIST & PAYWALL ---
 admin_whitelist = st.secrets.get("whitelist", ["your-email@gmail.com"])
 
 if st.user.email in admin_whitelist:
     st.sidebar.success(f"🌟 VIP Access: {st.user.email}")
-    # We skip add_auth() entirely for whitelisted users
 else:
-    # Everyone else must have an active Stripe subscription
     add_auth(
         required=True,
         subscription_button_text="Unlock Pro Insights",
         button_color="#FF4B4B"
     )
 
-# --- 3. MAIN DASHBOARD LOGIC ---
-# This part only runs if the user is whitelisted OR has paid.
+# --- 3. PRO DASHBOARD ---
 st.set_page_config(page_title="NFL Sharp Pro", layout="wide", page_icon="🏈")
 st.title(f"🏈 NFL Sharp Pro: Welcome {st.user.name}")
 
-@st.cache_data(show_spinner="Updating NFL Data...")
+@st.cache_data(show_spinner="Syncing NFL Data...")
 def load_nfl_data_pro():
     try:
         years = [2024, 2025]
@@ -46,20 +40,19 @@ def load_nfl_data_pro():
         sched = nfl.load_schedules(seasons=years).to_pandas()
         pbp = nfl.load_pbp(seasons=years).to_pandas() 
         
-        # Data Cleaning
+        # Standardize team naming
         if 'recent_team' not in weekly.columns:
             team_col = 'team' if 'team' in weekly.columns else 'team_abbr'
             weekly = weekly.rename(columns={team_col: 'recent_team'})
         
-        weekly = weekly.dropna(subset=['player_name', 'position'])
+        # Clean metrics
         metrics = ['passing_yards', 'rushing_yards', 'receiving_yards', 'passing_tds', 'rushing_tds', 'receiving_tds']
         for m in metrics: 
             weekly[m] = pd.to_numeric(weekly[m], errors='coerce').fillna(0)
         
         weekly['total_scrimmage_yards'] = weekly['rushing_yards'] + weekly['receiving_yards']
-        weekly['total_scrimmage_tds'] = weekly['rushing_tds'] + weekly['receiving_tds']
         
-        # Environment & Defense
+        # Defense & Weather
         def_epa = pbp.groupby(['season', 'week', 'defteam'])['epa'].mean().reset_index(name='def_epa_allowed')
         df = weekly.merge(sched[['season', 'week', 'home_team', 'temp', 'surface', 'wind']], 
                           left_on=['season', 'week', 'recent_team'], right_on=['season', 'week', 'home_team'], how='left')
@@ -69,54 +62,49 @@ def load_nfl_data_pro():
         df['is_grass'] = df['surface'].str.lower().str.contains('grass', na=False).astype(int)
         
         return df
-    except Exception:
+    except Exception as e:
+        st.error(f"Data Sync Error: {e}")
         return pd.DataFrame()
 
 data = load_nfl_data_pro()
 
-if data.empty:
-    st.error("⚠️ Error loading data. Please refresh.")
-    st.stop()
+if not data.empty:
+    # Sidebar
+    st.sidebar.header("Game Environment")
+    curr_wind = st.sidebar.slider("Wind Speed", 0, 40, 5)
+    curr_temp = st.sidebar.slider("Temp", 0, 100, 65)
+    is_grass_val = 1 if st.sidebar.radio("Field", ["Grass", "Turf"]) == "Grass" else 0
 
-# --- SIDEBAR CONTROLS ---
-st.sidebar.header("Pro Settings")
-curr_wind = st.sidebar.slider("Wind (MPH)", 0, 40, 5)
-curr_temp = st.sidebar.slider("Temp (F)", 0, 100, 65)
-is_grass_val = 1 if st.sidebar.radio("Field", ["Grass", "Turf"]) == "Grass" else 0
-
-player_list = sorted(data['player_name'].unique())
-selected_player = st.selectbox("Search Player", player_list)
-opp_list = sorted(data['opponent_team'].unique())
-selected_opp = st.selectbox("Opponent", opp_list)
-
-player_subset = data[data['player_name'] == selected_player]
-player_pos = player_subset['position'].iloc[-1]
-vegas_line = st.sidebar.number_input("Vegas Line", value=225.5 if player_pos == 'QB' else 65.5)
-
-# --- MODEL ---
-def get_prediction(df, player_name, target_stat, temp, wind, is_grass, opp_team):
-    pos = df[df['player_name'] == player_name]['position'].iloc[-1]
-    pos_data = df[df['position'] == pos].copy()
-    features = ['temp', 'wind', 'is_grass', 'def_epa_allowed']
-    model = XGBRegressor(n_estimators=45, max_depth=3).fit(pos_data[features].fillna(0), pos_data[target_stat])
+    # Player Selection
+    selected_player = st.selectbox("Search Player", sorted(data['player_name'].unique()))
+    selected_opp = st.selectbox("Opponent Defense", sorted(data['opponent_team'].unique()))
     
-    opp_epa = df[df['opponent_team'] == opp_team]['def_epa_allowed'].mean()
-    input_df = pd.DataFrame([[temp, wind, is_grass, opp_epa]], columns=features)
-    return model.predict(input_df)[0]
+    player_subset = data[data['player_name'] == selected_player]
+    player_pos = player_subset['position'].iloc[-1]
+    
+    # Prediction
+    def get_prediction(df, player_name, target_stat, temp, wind, is_grass, opp_team):
+        pos = df[df['player_name'] == player_name]['position'].iloc[-1]
+        pos_data = df[df['position'] == pos].copy()
+        features = ['temp', 'wind', 'is_grass', 'def_epa_allowed']
+        
+        # This is where sklearn is required
+        model = XGBRegressor(n_estimators=45, max_depth=3).fit(pos_data[features].fillna(0), pos_data[target_stat])
+        
+        opp_epa = df[df['opponent_team'] == opp_team]['def_epa_allowed'].mean()
+        input_data = pd.DataFrame([[temp, wind, is_grass, opp_epa]], columns=features)
+        return model.predict(input_data)[0]
 
-# --- DISPLAY ---
-target = 'passing_yards' if player_pos == 'QB' else 'total_scrimmage_yards'
-proj = get_prediction(data, selected_player, target, curr_temp, curr_wind, is_grass_val, selected_opp)
+    target = 'passing_yards' if player_pos == 'QB' else 'total_scrimmage_yards'
+    proj = get_prediction(data, selected_player, target, curr_temp, curr_wind, is_grass_val, selected_opp)
 
-st.header(f"📊 {selected_player} Projections")
-c1, c2, c3 = st.columns(3)
-with c1: st.metric("Model Proj", f"{proj:.1f} Yds")
-with c2: st.success(f"🎯 RECOMMENDED: {int(proj*0.85/5)*5}+ Yards")
-with c3:
-    edge = proj - vegas_line
-    st.metric("Vegas Edge", f"{edge:.1f} yds", delta=f"{((edge)/vegas_line)*100:.1f}%")
-
-st.plotly_chart(px.line(player_subset, x='week', y=target, title="Weekly Trends"), use_container_width=True)
+    # UI
+    st.header(f"📊 {selected_player} Prediction")
+    c1, c2 = st.columns(2)
+    c1.metric("Model Projection", f"{proj:.1f} Yds")
+    c2.success(f"🎯 RECOMMENDED: {int(proj*0.85/5)*5}+ Yards")
+    
+    st.plotly_chart(px.line(player_subset, x='week', y=target, title="Yardage History"), use_container_width=True)
 
 st.divider()
 if st.sidebar.button("Log Out"):
