@@ -8,18 +8,21 @@ from scipy.stats import poisson
 
 # 1. PAGE SETUP
 st.set_page_config(page_title="NFL Sharp: Analytics & Matchup Engine", layout="wide")
-st.title("🏈 NFL Sharp: Analytics & Prediction Dashboard")
 
-@st.cache_data(show_spinner="Updating NFL Database...")
+@st.cache_data(show_spinner="Deep-Syncing NFL Data...")
 def load_nfl_data_pro():
+    """
+    Fetches and cleans NFL data. 
+    Guarantees a DataFrame return to prevent 'NoneType' errors.
+    """
     try:
-        # Load multiple seasons for a stable predictive model
         years = [2023, 2024, 2025]
+        # Attempt to load data
         weekly = nfl.load_player_stats(seasons=years).to_pandas()
         sched = nfl.load_schedules(seasons=years).to_pandas()
         pbp = nfl.load_pbp(seasons=[2024, 2025]).to_pandas() 
         
-        # Guard 1: If nflreadpy returns None or an empty set, return an empty DataFrame
+        # Guard: If the network returned nothing, return an empty DF immediately
         if weekly is None or weekly.empty:
             return pd.DataFrame()
 
@@ -27,7 +30,7 @@ def load_nfl_data_pro():
         if 'recent_team' not in weekly.columns:
             weekly = weekly.rename(columns={'team': 'recent_team', 'team_abbr': 'recent_team'})
         
-        # Ensure Numeric Columns
+        # Numeric Cleaning & Feature Engineering
         metrics = ['passing_yards', 'rushing_yards', 'receiving_yards', 'passing_tds']
         for m in metrics: 
             if m in weekly.columns:
@@ -39,12 +42,12 @@ def load_nfl_data_pro():
         # Defense Stats (EPA)
         def_epa = pbp.groupby(['season', 'week', 'defteam'])['epa'].mean().reset_index(name='def_epa_allowed')
         
-        # Rolling Averages (Player Velocity)
+        # Rolling Averages
         weekly = weekly.sort_values(['player_name', 'season', 'week'])
         weekly['yards_roll3'] = weekly.groupby('player_name')['total_scrimmage_yards'].transform(lambda x: x.rolling(3, 1).mean())
         weekly['pass_roll3'] = weekly.groupby('player_name')['passing_yards'].transform(lambda x: x.rolling(3, 1).mean())
 
-        # Master Data Merge
+        # Final Merge
         df = weekly.merge(sched[['season', 'week', 'home_team', 'temp', 'surface', 'wind']], 
                           left_on=['season', 'week', 'recent_team'], right_on=['season', 'week', 'home_team'], how='left')
         df = df.merge(def_epa, left_on=['season', 'week', 'opponent_team'], right_on=['season', 'week', 'defteam'], how='left')
@@ -52,30 +55,34 @@ def load_nfl_data_pro():
         df[['wind', 'temp', 'def_epa_allowed']] = df[['wind', 'temp', 'def_epa_allowed']].fillna(0)
         df['is_grass'] = df['surface'].str.lower().str.contains('grass', na=False).astype(int)
         
-        return df # Success
-    except Exception as e:
-        # Guard 2: If the network fails, return empty DF instead of None
+        return df
+    except Exception:
+        # Final safety net: return empty DF so the app handles it gracefully
         return pd.DataFrame()
 
 # --- INITIALIZE DATA ---
 data = load_nfl_data_pro()
 
-# --- THE CRITICAL FIX: SAFETY GUARD ---
-# Guard 3: This halts the app BEFORE line 83 if the data didn't load.
-if data.empty or 'player_name' not in data.columns:
-    st.warning("🔄 The NFL data server is taking too long to respond. This is common during peak hours.")
-    if st.button("Force Re-Sync Data"):
+# --- THE HARD GUARD: PREVENTS ERROR AT LINE 79 ---
+if data is None or data.empty or 'player_name' not in data.columns:
+    st.title("🏈 NFL Sharp: Analytics Engine")
+    st.error("⚠️ The NFLverse Data Server is currently unresponsive.")
+    st.info("This is usually a temporary API timeout. Please click the button below to retry.")
+    if st.button("🔄 Force Re-Sync Data"):
         st.cache_data.clear()
         st.rerun()
-    st.stop() # Prevents the "NoneType" crash on line 83
+    st.stop() # CRITICAL: This stops the app before it hits line 79
 
-# --- DASHBOARD STARTS HERE ---
+# --- DASHBOARD UI (REINSTATED) ---
+st.title("🏈 NFL Sharp: Analytics & Matchup Engine")
+
+# Sidebars
 st.sidebar.header("Game Environment")
 curr_wind = st.sidebar.slider("Wind (MPH)", 0, 40, 5)
 curr_temp = st.sidebar.slider("Temp (F)", 0, 100, 65)
-is_grass_val = 1 if st.sidebar.radio("Field Type", ["Grass", "Turf"]) == "Grass" else 0
+is_grass_val = 1 if st.sidebar.radio("Field Surface", ["Grass", "Turf"]) == "Grass" else 0
 
-# Line 83: This is now protected from crashing
+# Selectors (Protected from crash)
 player_list = sorted(data['player_name'].unique())
 selected_player = st.selectbox("Search Player", player_list)
 opp_list = sorted(data['opponent_team'].unique())
@@ -83,17 +90,18 @@ selected_opp = st.selectbox("Select Upcoming Opponent", opp_list)
 
 player_subset = data[data['player_name'] == selected_player]
 player_pos = player_subset['position'].iloc[-1]
-vegas_line = st.sidebar.number_input("Vegas Line", value=225.5 if player_pos == 'QB' else 65.5)
+vegas_line = st.sidebar.number_input("Sportsbook Line", value=225.5 if player_pos == 'QB' else 65.5)
 
-# --- PREDICTION ENGINE ---
+# --- PREDICTION ENGINE (ADVANCED) ---
 def get_advanced_pred(df, player_name, target_stat, temp, wind, is_grass, opp_team):
+    # Position-based training solves the Caleb Williams/Turf outlier problem
     pos = df[df['player_name'] == player_name]['position'].iloc[-1]
     pos_df = df[df['position'] == pos].copy()
     roll_col = 'pass_roll3' if pos == 'QB' else 'yards_roll3'
     features = ['temp', 'wind', 'is_grass', 'def_epa_allowed', roll_col]
     
-    # Train robust model
-    model = XGBRegressor(n_estimators=50, max_depth=3, reg_lambda=15).fit(pos_df[features].fillna(0), pos_df[target_stat])
+    # Train model with L2 regularization for stability
+    model = XGBRegressor(n_estimators=50, max_depth=3, reg_lambda=20).fit(pos_df[features].fillna(0), pos_df[target_stat])
     
     opp_epa = df[df['opponent_team'] == opp_team]['def_epa_allowed'].mean()
     p_latest = df[df['player_name'] == player_name].iloc[-1]
@@ -109,14 +117,14 @@ st.header(f"📊 {selected_player} vs {selected_opp}")
 c1, c2, c3 = st.columns(3)
 with c1:
     st.metric("Model Projection", f"{proj:.1f} Yds")
-    st.success(f"🎯 RECOMMEND: {int(proj*0.85/5)*5}+ Yards")
+    st.success(f"🎯 RECOMMENDED: {int(proj*0.85/5)*5}+ Yards")
 with c2:
     edge = proj - vegas_line
     st.metric("Vegas Edge", f"{edge:.1f} yds", delta=f"{((edge)/vegas_line)*100:.1f}%")
 with c3:
     st.plotly_chart(px.line(player_subset, x='week', y=[target, 'yards_roll3' if player_pos != 'QB' else 'pass_roll3'], title="Trend Analysis"), use_container_width=True)
 
-# --- TD GRAPH & HISTORY ---
+# --- HISTORY & EFFICIENCY ---
 st.divider()
 g1, g2 = st.columns(2)
 with g1:
