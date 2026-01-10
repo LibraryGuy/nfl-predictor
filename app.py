@@ -11,12 +11,21 @@ import sklearn
 if "parlay_legs" not in st.session_state:
     st.session_state.parlay_legs = []
 
-# --- 2. NATIVE AUTHENTICATION GATE ---
+# --- 1. NATIVE AUTHENTICATION GATE ---
 if not st.user.is_logged_in:
+    # Set page config for mobile-friendly view
     st.set_page_config(page_title="NFL Sharp - Login", page_icon="🏈")
+    
+    # Place content in the CENTER of the mobile screen
     st.title("🏈 NFL Sharp: Pro Predictor")
-    st.info("Please log in with your Google account to access pro-tier analytics.")
-    st.button("Log in with Google", on_click=st.login, type="primary")
+    st.markdown("### Secure Member Login")
+    st.info("Log in with Google to access your account or bypass the paywall if you are on the whitelist.")
+    
+    # Large, easy-to-tap button for mobile users
+    st.button("Log in with Google", on_click=st.login, type="primary", use_container_width=True)
+    
+    # Visual cue for those who might have trouble
+    st.caption("Whitelisted users: You must log in here first to skip the subscription.")
     st.stop()
 
 # --- 3. WHITELIST & PAYWALL ---
@@ -126,3 +135,4 @@ st.plotly_chart(px.line(player_subset, x='week', y=target, title="Performance Tr
 
 if st.sidebar.button("Log Out"):
     st.logout()
+
