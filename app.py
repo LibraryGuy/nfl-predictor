@@ -10,20 +10,20 @@ from scipy.stats import poisson
 st.set_page_config(page_title="NFL Sharp: Advanced Analytics", layout="wide")
 st.title("🏈 NFL Sharp: Analytics & Matchup Engine")
 
-@st.cache_data(show_spinner="Deep-Syncing NFLverse Data (2023-2025)...")
+@st.cache_data(show_spinner="Syncing 3-Year NFL Database...")
 def load_advanced_data():
     try:
         years = [2023, 2024, 2025]
-        # Fetching core data
+        # Download core files
         weekly = nfl.load_player_stats(seasons=years).to_pandas()
         sched = nfl.load_schedules(seasons=years).to_pandas()
         pbp = nfl.load_pbp(seasons=[2024, 2025]).to_pandas() 
         
-        # Guard against empty downloads
-        if weekly.empty or sched.empty:
+        # Validation Layer 1: Check if download actually worked
+        if weekly is None or weekly.empty:
             return pd.DataFrame()
 
-        # Clean Column Names
+        # Column Normalization
         if 'recent_team' not in weekly.columns:
             weekly = weekly.rename(columns={'team': 'recent_team', 'team_abbr': 'recent_team'})
             
@@ -35,15 +35,15 @@ def load_advanced_data():
         weekly['total_scrimmage_yards'] = weekly['rushing_yards'] + weekly['receiving_yards']
         weekly['total_scrimmage_tds'] = weekly.get('rushing_tds', 0) + weekly.get('receiving_tds', 0)
         
-        # Advanced Feature Engineering: Defense EPA
+        # Defense EPA (Efficiency Metrics)
         def_epa = pbp.groupby(['season', 'week', 'defteam'])['epa'].mean().reset_index(name='def_epa_allowed')
         
-        # Rolling Averages
+        # Rolling Metrics
         weekly = weekly.sort_values(['player_name', 'season', 'week'])
         weekly['yards_roll3'] = weekly.groupby('player_name')['total_scrimmage_yards'].transform(lambda x: x.rolling(3, 1).mean())
         weekly['pass_roll3'] = weekly.groupby('player_name')['passing_yards'].transform(lambda x: x.rolling(3, 1).mean())
         
-        # Merge Environment & Defense
+        # Master Merge
         df = weekly.merge(sched[['season', 'week', 'home_team', 'temp', 'surface', 'wind']], 
                           left_on=['season', 'week', 'recent_team'], right_on=['season', 'week', 'home_team'], how='left')
         df = df.merge(def_epa, left_on=['season', 'week', 'opponent_team'], right_on=['season', 'week', 'defteam'], how='left')
@@ -51,29 +51,76 @@ def load_advanced_data():
         df[['wind', 'temp', 'def_epa_allowed']] = df[['wind', 'temp', 'def_epa_allowed']].fillna(0)
         df['is_grass'] = df['surface'].str.lower().str.contains('grass', na=False).astype(int)
         
-        return df # Always return a DataFrame
+        return df
     except Exception as e:
-        st.error(f"⚠️ Data Sync Failed: {e}")
-        return pd.DataFrame() # Return empty DF instead of None
+        st.error(f"⚠️ Data Sync Failure: {e}")
+        return pd.DataFrame()
 
-# --- INITIALIZE DATA ---
+# --- INITIALIZE & GUARD ---
 data = load_advanced_data()
 
-# --- THE CRITICAL SAFETY GUARD ---
-if data.empty:
-    st.warning("🔄 The NFL data is currently unavailable. This is usually a temporary connection issue. Please refresh the page.")
-    st.stop() # This prevents the crash on Line 70
+# Validation Layer 2: Explicitly stop if data is None or lacks columns
+if data is None or data.empty or 'player_name' not in data.columns:
+    st.warning("🔄 Connecting to NFLverse servers... please refresh in 30 seconds.")
+    if st.button("Force Re-Sync Data"):
+        st.cache_data.clear()
+        st.rerun()
+    st.stop()
 
-# --- SIDEBAR & SELECTIONS ---
-st.sidebar.header("Matchup Environment")
-curr_wind = st.sidebar.slider("Wind (MPH)", 0, 40, 5)
-curr_temp = st.sidebar.slider("Temp (F)", 0, 100, 65)
-is_grass_val = 1 if st.sidebar.radio("Field Surface", ["Grass", "Turf"]) == "Grass" else 0
-
-# Now safe from TypeError
+# --- SELECTIONS (Line 74 Fix) ---
+# This section is now protected by the 'st.stop()' above
 player_list = sorted(data['player_name'].unique())
 selected_player = st.selectbox("Search Player", player_list)
 opp_list = sorted(data['opponent_team'].unique())
-selected_opp = st.selectbox("Select Upcoming Opponent (Defense)", opp_list)
+selected_opp = st.selectbox("Select Upcoming Opponent", opp_list)
 
-# ... [Rest of your prediction and dashboard code] ...
+player_subset = data[data['player_name'] == selected_player]
+player_pos = player_subset['position'].iloc[-1]
+vegas_line = st.sidebar.number_input("Sportsbook Line", value=225.5 if player_pos == 'QB' else 65.5)
+
+# --- ADVANCED PREDICTION ENGINE (Optimized for Small Samples) ---
+def get_advanced_pred(df, player_name, target_stat, temp, wind, is_grass, opp_team):
+    pos = df[df['player_name'] == player_name]['position'].iloc[-1]
+    pos_df = df[df['position'] == pos].copy()
+    
+    roll_col = 'pass_roll3' if pos == 'QB' else 'yards_roll3'
+    features = ['temp', 'wind', 'is_grass', 'def_epa_allowed', roll_col]
+    
+    # Advanced XGBoost: High lambda (20) forces the model to ignore 1-game flukes (like Caleb on turf)
+    model = XGBRegressor(n_estimators=60, max_depth=3, reg_lambda=20).fit(pos_df[features].fillna(0), pos_df[target_stat])
+    
+    opp_epa = df[df['opponent_team'] == opp_team]['def_epa_allowed'].mean()
+    p_latest = df[df['player_name'] == player_name].iloc[-1]
+    
+    input_data = pd.DataFrame([[temp, wind, is_grass, opp_epa, p_latest[roll_col]]], columns=features)
+    raw_proj = model.predict(input_data)[0]
+    
+    # Layer 3: The Hard Floor (60% of Volume)
+    return max(raw_proj, p_latest[roll_col] * 0.6)
+
+# --- DASHBOARD OUTPUT ---
+target = 'passing_yards' if player_pos == 'QB' else 'total_scrimmage_yards'
+proj = get_advanced_pred(data, selected_player, target, st.sidebar.slider("Wind", 0, 40, 5), 
+                         st.sidebar.slider("Temp", 0, 100, 65), 1 if is_grass_val else 0, selected_opp)
+
+st.header(f"📊 {selected_player} vs {selected_opp}")
+c1, c2, c3 = st.columns(3)
+c1.metric("Model Projection", f"{proj:.1f} Yds")
+c2.metric("Vegas Edge", f"{proj - vegas_line:.1f}", delta=f"{((proj-vegas_line)/vegas_line)*100:.1f}%")
+c3.success(f"🎯 RECOMMENDED: {int(proj*0.85/5)*5}+ Yards")
+
+# --- MATCHUP HISTORY ---
+st.subheader(f"🏟️ Career Performance vs. {selected_opp}")
+m_hist = player_subset[player_subset['opponent_team'] == selected_opp][['season', 'week', target, 'total_scrimmage_tds', 'surface']]
+if not m_hist.empty:
+    st.table(m_hist.rename(columns={target: 'Yards', 'total_scrimmage_tds': 'TDs'}))
+else:
+    st.info("No historical head-to-head matchups found.")
+
+# --- CHARTS & PARLAY BUILDER ---
+st.divider()
+g1, g2 = st.columns(2)
+with g1:
+    st.plotly_chart(px.line(player_subset, x='week', y=[target, roll_col], title="Performance Velocity"), use_container_width=True)
+with g2:
+    st.plotly_chart(px.scatter(player_subset, x='total_scrimmage_yards', y='total_scrimmage_tds', trendline="ols", title="Efficiency Map"), use_container_width=True)
