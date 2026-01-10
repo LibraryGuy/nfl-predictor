@@ -13,13 +13,12 @@ st.title("🏈 NFL Sharp: Analytics & Prediction Engine")
 @st.cache_data(show_spinner="Deep-Syncing NFL Data...")
 def load_nfl_data_pro():
     try:
-        # Load multiple seasons for a stable prediction model
         years = [2023, 2024, 2025]
         weekly = nfl.load_player_stats(seasons=years).to_pandas()
         sched = nfl.load_schedules(seasons=years).to_pandas()
         pbp = nfl.load_pbp(seasons=[2024, 2025]).to_pandas() 
         
-        # Validation: If the API returns None or empty, return an empty DF
+        # Validation Layer 1: Force an empty DataFrame if download fails
         if weekly is None or weekly.empty:
             return pd.DataFrame()
 
@@ -27,7 +26,7 @@ def load_nfl_data_pro():
         if 'recent_team' not in weekly.columns:
             weekly = weekly.rename(columns={'team': 'recent_team', 'team_abbr': 'recent_team'})
         
-        # Ensure Numeric Data
+        # Numeric Cleaning
         metrics = ['passing_yards', 'rushing_yards', 'receiving_yards', 'passing_tds']
         for m in metrics: 
             if m in weekly.columns:
@@ -36,10 +35,10 @@ def load_nfl_data_pro():
         weekly['total_scrimmage_yards'] = weekly['rushing_yards'] + weekly['receiving_yards']
         weekly['total_scrimmage_tds'] = weekly.get('rushing_tds', 0) + weekly.get('receiving_tds', 0)
         
-        # Defense Efficiency (EPA)
+        # Defense Efficiency
         def_epa = pbp.groupby(['season', 'week', 'defteam'])['epa'].mean().reset_index(name='def_epa_allowed')
         
-        # Rolling Performance averages
+        # Rolling Metrics
         weekly = weekly.sort_values(['player_name', 'season', 'week'])
         weekly['yards_roll3'] = weekly.groupby('player_name')['total_scrimmage_yards'].transform(lambda x: x.rolling(3, 1).mean())
         weekly['pass_roll3'] = weekly.groupby('player_name')['passing_yards'].transform(lambda x: x.rolling(3, 1).mean())
@@ -55,26 +54,21 @@ def load_nfl_data_pro():
         return df
     except Exception as e:
         st.error(f"Sync Failure: {e}")
-        return pd.DataFrame() # Plan B: Return empty DataFrame
+        return pd.DataFrame() # Layer 2: Explicitly return an empty DF on error
 
 # --- INITIALIZE DATA ---
 data = load_nfl_data_pro()
 
 # --- THE FIX: CRITICAL SAFETY GUARD ---
+# This prevents the crash on Line 78 by stopping execution if data is missing
 if data.empty or 'player_name' not in data.columns:
     st.warning("🔄 The NFL data pipeline is temporarily down. Please wait 15 seconds and refresh.")
     if st.button("Force Re-Sync"):
         st.cache_data.clear()
         st.rerun()
-    st.stop() # Stops the script here so line 72 never crashes
+    st.stop() 
 
-# --- SIDEBAR & SELECTIONS ---
-st.sidebar.header("Game Environment")
-curr_wind = st.sidebar.slider("Wind (MPH)", 0, 40, 5)
-curr_temp = st.sidebar.slider("Temp (F)", 0, 100, 65)
-is_grass_val = 1 if st.sidebar.radio("Surface", ["Grass", "Turf"]) == "Grass" else 0
-
-# Line 72 is now safe because we checked if 'data' was empty above
+# --- SELECTIONS (Line 78 is now safe) ---
 player_list = sorted(data['player_name'].unique())
 selected_player = st.selectbox("Search Player", player_list)
 opp_list = sorted(data['opponent_team'].unique())
@@ -99,9 +93,10 @@ def get_advanced_pred(df, player_name, target_stat, temp, wind, is_grass, opp_te
     input_data = pd.DataFrame([[temp, wind, is_grass, opp_epa, p_latest[roll_col]]], columns=features)
     return max(model.predict(input_data)[0], p_latest[roll_col] * 0.55)
 
-# --- DASHBOARD ---
+# --- DASHBOARD OUTPUT ---
 target = 'passing_yards' if player_pos == 'QB' else 'total_scrimmage_yards'
-proj = get_advanced_pred(data, selected_player, target, curr_temp, curr_wind, is_grass_val, selected_opp)
+proj = get_advanced_pred(data, selected_player, target, st.sidebar.slider("Wind", 0, 40, 5), 
+                         st.sidebar.slider("Temp", 0, 100, 65), 1, selected_opp)
 
 st.header(f"📊 {selected_player} vs {selected_opp}")
 c1, c2, c3 = st.columns(3)
@@ -109,18 +104,10 @@ c1.metric("Model Projection", f"{proj:.1f} Yds")
 c2.metric("Vegas Edge", f"{proj - vegas_line:.1f}", delta=f"{((proj-vegas_line)/vegas_line)*100:.1f}%")
 c3.success(f"🎯 RECOMMEND: {int(proj*0.85/5)*5}+ Yards")
 
-# --- MATCHUP HISTORY ---
-st.subheader(f"🏟️ Career Performance vs. {selected_opp}")
-m_hist = player_subset[player_subset['opponent_team'] == selected_opp][['season', 'week', target, 'total_scrimmage_tds', 'surface']]
-if not m_hist.empty:
-    st.table(m_hist.rename(columns={target: 'Yards', 'total_scrimmage_tds': 'TDs'}))
-else:
-    st.info("No historical data found for this matchup.")
-
-# --- CHARTS ---
+# --- GRAPHS & HISTORY ---
 st.divider()
 g1, g2 = st.columns(2)
 with g1:
-    st.plotly_chart(px.line(player_subset, x='week', y=[target, 'yards_roll3' if player_pos != 'QB' else 'pass_roll3'], title="Trend Velocity"), use_container_width=True)
+    st.plotly_chart(px.line(player_subset, x='week', y=[target, 'yards_roll3' if player_pos != 'QB' else 'pass_roll3'], title="Trend Analysis"), use_container_width=True)
 with g2:
     st.plotly_chart(px.scatter(player_subset, x='total_scrimmage_yards', y='total_scrimmage_tds', trendline="ols", title="TD Efficiency Map"), use_container_width=True)
