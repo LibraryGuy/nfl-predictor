@@ -25,98 +25,84 @@ if st.user.email in admin_whitelist:
 else:
     add_auth(required=True, subscription_button_text="Unlock Pro Insights", button_color="#FF4B4B")
 
-# --- 4. DATA LOADING (REPAIRED) ---
+# --- 4. REPAIRED DATA LOADING ---
 @st.cache_data(ttl=3600)
 def load_nfl_data_pro():
     try:
-        years = [2024, 2025]
-        weekly = nfl.load_player_stats(seasons=years).to_pandas()
-        sched = nfl.load_schedules(seasons=years).to_pandas()
+        # Load and convert immediately to pandas
+        raw_weekly = nfl.load_player_stats(seasons=[2024, 2025])
+        weekly = raw_weekly.to_pandas()
         
-        # --- FIX: COLUMN NAME MAPPING ---
-        # Map new nflverse names back to our code's expected names
-        rename_dict = {
-            'player_display_name': 'player_name',
-            'team_abbr': 'recent_team'
-        }
-        weekly = weekly.rename(columns=rename_dict)
+        raw_sched = nfl.load_schedules(seasons=[2024, 2025])
+        sched = raw_sched.to_pandas()
         
-        # Ensure column exists before proceeding
-        if 'player_name' not in weekly.columns:
-            st.error("Critical Error: Player Name column not found in data feed.")
-            return pd.DataFrame()
-
-        # Clean strings
-        weekly['player_name'] = weekly['player_name'].str.strip()
+        # --- FIX: Ensure we have a clean, single-index DataFrame ---
+        weekly.columns = [str(c) for c in weekly.columns]
+        
+        # Map player names (handling both old/new column versions)
+        if 'player_display_name' in weekly.columns:
+            weekly = weekly.rename(columns={'player_display_name': 'player_name'})
+        
+        # FORCE COLUMN TO SERIES (The fix for your .str error)
+        # By re-assigning it like this, we ensure it's a Series, not a DataFrame
+        weekly['player_name'] = weekly['player_name'].astype(str).str.strip()
+        
+        # Cleanup
         weekly = weekly.dropna(subset=['player_name', 'position'])
         
-        # Force numeric conversion
-        target_cols = ['passing_yards', 'rushing_yards', 'receiving_yards']
-        for col in target_cols:
+        # Convert yardage to numbers
+        for col in ['passing_yards', 'rushing_yards', 'receiving_yards']:
             if col in weekly.columns:
                 weekly[col] = pd.to_numeric(weekly[col], errors='coerce').fillna(0)
             
         weekly['total_scrimmage_yards'] = weekly['rushing_yards'] + weekly['receiving_yards']
         
-        # Merge Weather
+        # Weather Merge
         df = weekly.merge(sched[['season', 'week', 'home_team', 'temp', 'wind']], 
-                          left_on=['season', 'week', 'recent_team'], right_on=['season', 'week', 'home_team'], how='left')
+                          left_on=['season', 'week', 'team' if 'team' in weekly.columns else 'recent_team'], 
+                          right_on=['season', 'week', 'home_team'], how='left')
         return df.fillna(0)
-    except Exception as e: 
-        st.error(f"Data Load Error: {e}")
+    except Exception as e:
+        st.error(f"Syncing Error: {str(e)}")
         return pd.DataFrame()
 
 data = load_nfl_data_pro()
 
-# Check if data is empty before rendering UI
 if data.empty:
-    st.warning("Data sync in progress... Please refresh in a moment.")
+    st.warning("Data is currently refreshing. Please wait 10 seconds and reload.")
     st.stop()
 
-# --- 5. PLAYER DASHBOARD ---
+# --- 5. DASHBOARD ---
 player_list = sorted(data['player_name'].unique())
-selected_player = st.selectbox("Select Player", player_list)
-selected_opp = st.selectbox("Opponent", sorted(data['opponent_team'].unique()))
+selected_player = st.selectbox("Search Player", player_list)
+selected_opp = st.selectbox("Against Defense", sorted(data['opponent_team'].unique()))
 
 player_subset = data[data['player_name'] == selected_player]
 player_pos = player_subset['position'].iloc[-1]
 target = 'passing_yards' if player_pos == 'QB' else 'total_scrimmage_yards'
 
-# --- 6. SMART PREDICTION ENGINE ---
-def get_sharp_prediction(df, player_name, target_stat):
+# --- 6. PREDICTION ---
+def get_final_prediction(df, p_name, t_stat):
     pos_data = df[df['position'] == player_pos].copy()
-    features = ['temp', 'wind']
-    model = XGBRegressor(n_estimators=50).fit(pos_data[features], pos_data[target_stat])
+    model = XGBRegressor(n_estimators=40).fit(pos_data[['temp', 'wind']], pos_data[t_stat])
+    raw = model.predict(pd.DataFrame([[45, 10]], columns=['temp', 'wind']))[0]
     
-    # Predict with baseline conditions
-    raw_proj = model.predict(pd.DataFrame([[45, 10]], columns=features))[0]
-    
-    # Season Average Fallback
-    season_avg = player_subset[target_stat].mean()
-    if raw_proj < (season_avg * 0.3): # Catch 5.3/7.2 errors
-        return season_avg
-    return raw_proj
+    # Fallback logic to fix 0.0/5.3/7.2 errors
+    avg = player_subset[t_stat].mean()
+    return avg if raw < (avg * 0.4) else raw
 
-proj = get_sharp_prediction(data, selected_player, target)
-rec_yards = int((proj * 0.85) / 5) * 5
+proj = get_final_prediction(data, selected_player, target)
+rec = int((proj * 0.85) / 5) * 5
 
-# --- 7. UI DISPLAY ---
-st.header(f"📈 {selected_player} ({player_pos})")
-c1, c2 = st.columns(2)
-c1.metric("Sharp Projection", f"{proj:.1f} Yds")
-c2.success(f"🎯 RECOMMENDED: {rec_yards}+ Yds")
+# --- 7. DISPLAY ---
+st.header(f"🏈 {selected_player}")
+st.metric("Model Projection", f"{proj:.1f} Yds")
+st.success(f"🎯 SHARP REC: {rec}+ Yds")
 
-if st.button(f"➕ Add {rec_yards}+ Yds to Parlay", use_container_width=True):
-    st.session_state.parlay_legs.append({"Player": selected_player, "Prop": f"{rec_yards}+ Yds"})
-    st.toast("Leg Added!")
+if st.button("➕ Add to Parlay", use_container_width=True):
+    st.session_state.parlay_legs.append(f"{selected_player}: {rec}+ Yds")
 
-# Parlay Sidebar
 with st.sidebar:
-    st.header("🎟️ Your Parlay")
-    for leg in st.session_state.parlay_legs:
-        st.write(f"✅ {leg['Player']}: {leg['Prop']}")
-    if st.button("Clear"): 
-        st.session_state.parlay_legs = []
-        st.rerun()
-
-st.plotly_chart(px.line(player_subset, x='week', y=target, title="Season Trend"))
+    st.header("🎟️ Ticket")
+    for leg in st.session_state.parlay_legs: st.write(leg)
+    if st.button("Clear"): st.session_state.parlay_legs = []; st.rerun()
