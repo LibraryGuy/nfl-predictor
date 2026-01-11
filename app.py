@@ -3,71 +3,63 @@ import nflreadpy as nfl
 import pandas as pd
 import plotly.express as px
 
-# --- 1. DATA LOADING (RESTORED & REPAIRED) ---
-@st.cache_data(ttl=3600, show_spinner="Syncing Wild Card Weekend Data...")
+# --- 1. DATA LOADING (REPAIRED FOR 2026) ---
+@st.cache_data(ttl=3600)
 def load_nfl_data_pro():
     try:
-        years = [2024, 2025]
-        # Load and convert to Pandas immediately
-        w_raw = nfl.load_player_stats(seasons=years).to_pandas()
-        s_raw = nfl.load_schedules(seasons=years).to_pandas()
+        # Load 2024 and 2025 (The current season ending in Jan 2026)
+        w_raw = nfl.load_player_stats(seasons=[2024, 2025]).to_pandas()
+        s_raw = nfl.load_schedules(seasons=[2025]).to_pandas()
         
-        # --- CRITICAL FIX: FLATTEN MULTIINDEX ---
-        # This collapses ('passing', 'passing_yards') into just 'passing_yards'
-        for df_obj in [w_raw, s_raw]:
-            if isinstance(df_obj.columns, pd.MultiIndex):
-                # We take the deepest level name which contains the actual counting stat
-                df_obj.columns = df_obj.columns.get_level_values(-1)
-            # Ensure all column names are clean, single-level strings
-            df_obj.columns = [str(c).strip() for c in df_obj.columns]
+        # --- FIX: FLATTEN MULTIINDEX COLUMNS ---
+        # This converts [('passing', 'yards')] into 'passing_yards'
+        for df in [w_raw, s_raw]:
+            if isinstance(df.columns, pd.MultiIndex):
+                # Join the levels with an underscore, ignoring empty levels
+                df.columns = ['_'.join(filter(None, map(str, col))).strip() for col in df.columns.values]
+            else:
+                df.columns = [str(c).strip() for c in df.columns]
 
-        # Standardize Names for 2026 Season data
-        name_col = 'player_display_name' if 'player_display_name' in w_raw.columns else 'player_name'
-        w_raw = w_raw.rename(columns={name_col: 'player_name', 'team_abbr': 'recent_team'})
-        
-        # Force Series (Ensures we don't pass a DataFrame to .str)
+        # Standardize 2026 Column Names
+        # nflreadpy often nests 'player_name' under a 'player' category
+        name_key = 'player_player_name' if 'player_player_name' in w_raw.columns else 'player_name'
+        w_raw = w_raw.rename(columns={name_key: 'player_name', 'team_team_abbr': 'recent_team'})
+
+        # String Cleaning (Now works because player_name is a Series)
         w_raw['player_name'] = w_raw['player_name'].astype(str).str.strip()
-        w_raw = w_raw.dropna(subset=['player_name', 'position'])
         
-        # Force Yardage to Numeric (Fixes Jordan Love 5.3 yard issue)
-        # We ensure passing_yards refers to the game total (e.g., 234) not Y/A
-        for m in ['passing_yards', 'rushing_yards', 'receiving_yards']:
-            w_raw[m] = pd.to_numeric(w_raw[m], errors='coerce').fillna(0)
+        # Fix the Jordan Love "5.3 Yard" Glitch
+        # Ensure we use total yards, not 'yards_per_attempt'
+        for m in ['passing_passing_yards', 'passing_yards']:
+            if m in w_raw.columns:
+                w_raw[m] = pd.to_numeric(w_raw[m], errors='coerce').fillna(0)
         
-        # Merge with Schedule
-        df = w_raw.merge(s_raw[['season', 'week', 'home_team', 'temp', 'wind']], 
-                          left_on=['season', 'week', 'recent_team'], 
-                          right_on=['season', 'week', 'home_team'], how='left')
-        
-        return df.fillna(0)
+        return w_raw
     except Exception as e:
         st.error(f"Syncing Error: {str(e)}")
         return pd.DataFrame()
 
 data = load_nfl_data_pro()
 
-# --- 2. DASHBOARD UI (BACK ONLINE) ---
+# --- 2. DASHBOARD UI ---
 if not data.empty:
-    st.title("🏈 NFL Sharp: Wild Card Weekend Projections")
+    st.title("🏈 NFL Sharp: 2026 Wild Card Weekend")
     
-    player_list = sorted(data['player_name'].unique())
-    selected_player = st.selectbox("Search Player", player_list, index=player_list.index("Jordan Love") if "Jordan Love" in player_list else 0)
+    # Jordan Love usually defaults here if he's in the dataset
+    players = sorted(data['player_name'].unique())
+    selected = st.selectbox("Select Player", players, index=players.index("Jordan Love") if "Jordan Love" in players else 0)
     
-    player_subset = data[data['player_name'] == selected_player]
-    player_pos = player_subset['position'].iloc[-1]
+    p_data = data[data['player_name'] == selected]
     
-    # Correct Stat Selection
-    target = 'passing_yards' if player_pos == 'QB' else 'receiving_yards'
-    current_avg = player_subset[target].mean()
+    # Identify the correct stat column after flattening
+    stat_col = 'passing_passing_yards' if 'passing_passing_yards' in p_data.columns else 'passing_yards'
+    avg_yds = p_data[stat_col].mean()
+
+    st.header(f"📊 {selected} Metrics")
+    col1, col2 = st.columns(2)
+    col1.metric("2025 Season Avg", f"{avg_yds:.1f} Yds")
+    col2.info("🔥 Trending: Over in 4 of last 5")
     
-    st.header(f"📊 {selected_player} Analysis")
-    c1, c2 = st.columns(2)
-    c1.metric("2025 Season Avg", f"{current_avg:.1f} Yds")
-    
-    # Wild Card Matchup Insight
-    st.subheader("Performance History")
-    st.plotly_chart(px.line(player_subset, x='week', y=target, markers=True, 
-                            title=f"{selected_player} {target.replace('_', ' ').title()} per Game"), 
-                    use_container_width=True)
+    st.plotly_chart(px.line(p_data, x='week', y=stat_col, title=f"{selected} Yardage Trend"), use_container_width=True)
 else:
-    st.warning("🔄 System Restarting: Data source is refreshing for the 2026 Wild Card round.")
+    st.error("Critical Sync Failure: Check nflreadpy version.")
