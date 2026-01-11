@@ -1,5 +1,4 @@
 import streamlit as st
-from st_paywall import add_auth
 import nflreadpy as nfl
 import pandas as pd
 import plotly.express as px
@@ -9,7 +8,7 @@ st.set_page_config(page_title="NFL Sharp Pro", layout="wide", page_icon="🏈")
 if "parlay_legs" not in st.session_state:
     st.session_state.parlay_legs = []
 
-# --- 2. DATA LOADING (CLEANED & REVERTED) ---
+# --- 2. DATA LOADING (REPAIRED) ---
 @st.cache_data(ttl=3600)
 def load_nfl_data_pro():
     try:
@@ -18,30 +17,25 @@ def load_nfl_data_pro():
         w_raw = nfl.load_player_stats(seasons=years).to_pandas()
         s_raw = nfl.load_schedules(seasons=years).to_pandas()
         
-        # --- THE FIX: COLLAPSE HEADERS WITHOUT LOSING NAMES ---
-        # This converts the MultiIndex into flat names like 'passing_yards'
-        # which prevents the 'AttributeError: str' crash.
+        # --- CRITICAL FIX: Flatten headers while keeping original names ---
         for df in [w_raw, s_raw]:
             if isinstance(df.columns, pd.MultiIndex):
-                # We drop the top level (e.g. 'offense') and keep the stat name (e.g. 'passing_yards')
+                # Drops the category level (e.g. 'offense') but keeps 'passing_yards'
                 df.columns = df.columns.get_level_values(-1)
+            # Remove any trailing spaces from column names
             df.columns = [str(c).strip() for c in df.columns]
 
-        # Standardize 'recent_team' and 'player_name'
-        # We check for common variants to ensure the merge doesn't fail
-        name_map = {'player_display_name': 'player_name', 'team_abbr': 'recent_team', 'team': 'recent_team'}
-        w_raw = w_raw.rename(columns=name_map)
+        # Map name variations to prevent 'recent_team' errors
+        w_raw = w_raw.rename(columns={'player_display_name': 'player_name', 'team_abbr': 'recent_team'})
         
-        # Ensure 'player_name' is a clean Series for .str functions
+        # Now 'player_name' is a 1D Series, so .str will work!
         w_raw['player_name'] = w_raw['player_name'].astype(str).str.strip()
         
-        # FORCE TOTAL YARDS: Fixes the 5.3 Jordan Love issue
-        # We ensure passing_yards is treated as a large integer/float
+        # Ensure we use Total Yards, not Averages (Fixes the 5.3 Jordan Love issue)
         if 'passing_yards' in w_raw.columns:
             w_raw['passing_yards'] = pd.to_numeric(w_raw['passing_yards'], errors='coerce').fillna(0)
 
         # Merge with Schedule (Weather, Lines, Field)
-        # Using inner join to ensure we only get games with valid weather/line data
         df = w_raw.merge(s_raw, left_on=['season', 'week', 'recent_team'], 
                          right_on=['season', 'week', 'home_team'], how='left')
         
@@ -72,7 +66,7 @@ with st.sidebar:
                 st.session_state.parlay_legs = []
                 st.rerun()
 
-# --- 4. MAIN DASHBOARD (REVERTED TO PREVIOUS VIEW) ---
+# --- 4. MAIN DASHBOARD (REVERTED) ---
 if not data.empty:
     p_data = data[data['player_name'] == selected_player]
     latest = p_data.iloc[-1]
@@ -81,13 +75,13 @@ if not data.empty:
     
     # METRICS ROW
     m1, m2, m3, m4 = st.columns(4)
-    # Re-verify Jordan Love: latest['passing_yards'] should now be 200+, not 5.3
+    # Corrected yardage verification
     m1.metric("Season Avg", f"{p_data['passing_yards'].mean():.1f} Yds")
     m2.metric("Temp", f"{latest.get('temp', 'N/A')}°F")
     m3.metric("Wind", f"{latest.get('wind', 0)} mph")
     m4.metric("Spread", latest.get('spread_line', 'N/A'))
 
-    # THE GRAPH
+    # GRAPH
     st.plotly_chart(px.line(p_data, x='week', y='passing_yards', markers=True, 
                             title="Weekly Yardage Trend"), use_container_width=True)
     
