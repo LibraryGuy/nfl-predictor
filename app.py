@@ -16,7 +16,7 @@ def load_nfl_data_pro():
         pbp_raw = nfl.load_pbp(seasons=years).to_pandas() 
         
         # --- CRITICAL FIX: COLLAPSE MULTIINDEX ---
-        # This turns ('passing', 'passing_yards') into just 'passing_yards'
+        # This converts ('passing', 'passing_yards') into just 'passing_yards'
         for df_obj in [weekly_raw, sched_raw, pbp_raw]:
             if isinstance(df_obj.columns, pd.MultiIndex):
                 # We take the deepest level (-1) which holds the actual metric name
@@ -24,7 +24,7 @@ def load_nfl_data_pro():
             # Ensure all column names are single-level strings with no hidden spaces
             df_obj.columns = [str(c).strip() for c in df_obj.columns]
 
-        # Fix column names for the 2026 data standard
+        # Standardize Names & Teams for the 2026 data standard
         name_col = 'player_display_name' if 'player_display_name' in weekly_raw.columns else 'player_name'
         weekly = weekly_raw.rename(columns={name_col: 'player_name', 'team_abbr': 'recent_team'})
         
@@ -32,16 +32,17 @@ def load_nfl_data_pro():
         weekly['player_name'] = weekly['player_name'].astype(str).str.strip()
         weekly = weekly.dropna(subset=['player_name', 'position'])
         
-        # Force Yardage to Numeric (This fixes the 5.3 yard error)
+        # Force Yardage to Numeric (This fixes the 5.3 yard error for Jordan Love)
         for m in ['passing_yards', 'rushing_yards', 'receiving_yards']:
             weekly[m] = pd.to_numeric(weekly[m], errors='coerce').fillna(0)
         
-        # Merge Weather & Defense
+        # Merge Weather & Defense EPA
         def_epa = pbp_raw.groupby(['season', 'week', 'defteam'])['epa'].mean().reset_index(name='def_epa_allowed')
         df = weekly.merge(sched_raw[['season', 'week', 'home_team', 'temp', 'wind', 'surface']], 
                           left_on=['season', 'week', 'recent_team'], 
                           right_on=['season', 'week', 'home_team'], how='left')
-        df = df.merge(def_epa, left_on=['season', 'week', 'opponent_team'], right_on=['season', 'week', 'defteam'], how='left')
+        df = df.merge(def_epa, left_on=['season', 'week', 'opponent_team'], 
+                      right_on=['season', 'week', 'defteam'], how='left')
         
         return df.fillna(0)
     except Exception as e:
@@ -50,7 +51,7 @@ def load_nfl_data_pro():
 
 data = load_nfl_data_pro()
 
-# --- 2. DASHBOARD LOGIC ---
+# --- 2. DASHBOARD LOGIC RESTORED ---
 if not data.empty:
     player_list = sorted(data['player_name'].unique())
     selected_player = st.selectbox("Search Player", player_list)
@@ -59,12 +60,14 @@ if not data.empty:
     player_pos = player_subset['position'].iloc[-1]
     target = 'passing_yards' if player_pos == 'QB' else 'rushing_yards'
     
-    # Jordan Love Correct Stats Verification
+    # Calculate Season Average (Jordan Love will now show correctly)
     current_avg = player_subset[target].mean()
     
-    st.header(f"📈 {selected_player} Analysis")
+    st.header(f"📈 {selected_player} Projections")
     c1, c2 = st.columns(2)
-    c1.metric("Season Avg Yards", f"{current_avg:.1f}")
-    c2.success(f"Sharp Projection: {current_avg * 1.05:.1f}")
+    c1.metric("Season Average", f"{current_avg:.1f} Yds")
+    c2.success(f"Sharp Projection: {current_avg * 1.05:.1f} Yds")
     
-    st.plotly_chart(px.line(player_subset, x='week', y=target, markers=True), use_container_width=True)
+    st.plotly_chart(px.line(player_subset, x='week', y=target, markers=True, 
+                            title=f"{selected_player} {target.replace('_', ' ').title()} History"), 
+                    use_container_width=True)
