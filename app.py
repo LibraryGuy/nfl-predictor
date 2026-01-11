@@ -3,12 +3,12 @@ import nflreadpy as nfl
 import pandas as pd
 import plotly.express as px
 
-# --- 1. SETUP ---
+# --- 1. CONFIG ---
 st.set_page_config(page_title="NFL Sharp Pro", layout="wide", page_icon="🏈")
 if "parlay_legs" not in st.session_state:
     st.session_state.parlay_legs = []
 
-# --- 2. THE DATA CURE (MANDATORY FLATTENING) ---
+# --- 2. THE DATA CURE ---
 @st.cache_data(ttl=3600)
 def load_nfl_data_pro():
     try:
@@ -17,41 +17,40 @@ def load_nfl_data_pro():
         s_raw = nfl.load_schedules(seasons=[2024, 2025]).to_pandas()
         
         # --- THE FIX: FORCED FLATTENING ---
-        # This converts [('player', 'player_name')] into just 'player_name'
+        # This collapses [('offense', 'passing_yards')] into 'passing_yards'
         for df in [w_raw, s_raw]:
             if isinstance(df.columns, pd.MultiIndex):
-                # Join levels with underscore if they exist, or just take the last level
-                df.columns = ['_'.join(filter(None, map(str, col))).strip() for col in df.columns.values]
-            else:
-                df.columns = [str(c).strip() for c in df.columns]
+                # We drop the top level (e.g., 'offense', 'player') to keep original names
+                df.columns = df.columns.get_level_values(-1)
+            # Remove any unintended whitespace or objects
+            df.columns = [str(c).strip() for c in df.columns]
 
-        # --- RE-MAPPING TO YOUR ORIGINAL VARIABLES ---
-        # The library renamed columns. We force them back so your old code doesn't break.
-        col_map = {
-            'player_player_name': 'player_name',
-            'player_display_name': 'player_name',
-            'team_recent_team': 'recent_team',
-            'team_team_abbr': 'recent_team',
-            'passing_passing_yards': 'passing_yards'
-        }
-        w_raw = w_raw.rename(columns=col_map)
+        # --- RE-MAPPING TO ORIGINAL KEYS ---
+        # Mapping common 2026 header changes back to your variables
+        mapping = {'player_display_name': 'player_name', 'team_abbr': 'recent_team'}
+        w_raw = w_raw.rename(columns=mapping)
 
-        # Now 'player_name' is a 1D Series. .str WILL work now.
+        # Now 'player_name' is a single column. String methods WILL work.
         if 'player_name' in w_raw.columns:
             w_raw['player_name'] = w_raw['player_name'].astype(str).str.strip()
         
+        # Ensure numeric types (Fixes the 5.3 yard average bug)
+        if 'passing_yards' in w_raw.columns:
+            w_raw['passing_yards'] = pd.to_numeric(w_raw['passing_yards'], errors='coerce').fillna(0)
+
         # Merge with Schedule
         df = w_raw.merge(s_raw, left_on=['season', 'week', 'recent_team'], 
                          right_on=['season', 'week', 'home_team'], how='left')
         
         return df.fillna(0)
     except Exception as e:
-        st.error(f"Critical Sync Failure: {str(e)}")
+        # If this fails, it will show you exactly which column is missing
+        st.error(f"Critical Failure: {str(e)}")
         return pd.DataFrame()
 
 data = load_nfl_data_pro()
 
-# --- 3. SIDEBAR (YOUR ORIGINAL UI) ---
+# --- 3. UI (ORIGINAL VIEW) ---
 with st.sidebar:
     st.title("🏈 NFL Sharp Pro")
     if not data.empty and 'player_name' in data.columns:
@@ -72,13 +71,12 @@ with st.sidebar:
 
 # --- 4. MAIN DASHBOARD ---
 if not data.empty:
-    # This filter now works because 'player_name' is a single column
     p_data = data[data['player_name'] == selected_player]
-    
     if not p_data.empty:
         latest = p_data.iloc[-1]
         st.header(f"📊 {selected_player} Analytics")
         
+        # Row 1
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Season Avg", f"{p_data['passing_yards'].mean():.1f} Yds")
         m2.metric("Temp", f"{latest.get('temp', 'N/A')}°F")
@@ -88,6 +86,6 @@ if not data.empty:
         st.plotly_chart(px.line(p_data, x='week', y='passing_yards', markers=True, 
                                 title="Weekly Yardage Trend"), use_container_width=True)
     else:
-        st.warning("No data found for this player.")
+        st.warning("Player data found but is empty.")
 else:
     st.warning("Syncing... please refresh in 30 seconds.")
