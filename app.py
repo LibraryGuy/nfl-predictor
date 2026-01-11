@@ -25,7 +25,7 @@ if st.user.email in admin_whitelist:
 else:
     add_auth(required=True, subscription_button_text="Unlock Pro Insights", button_color="#FF4B4B")
 
-# --- 4. ROBUST DATA LOAD ---
+# --- 4. DATA LOADING (REPAIRED) ---
 @st.cache_data(ttl=3600)
 def load_nfl_data_pro():
     try:
@@ -33,14 +33,28 @@ def load_nfl_data_pro():
         weekly = nfl.load_player_stats(seasons=years).to_pandas()
         sched = nfl.load_schedules(seasons=years).to_pandas()
         
-        # Standardize Names
+        # --- FIX: COLUMN NAME MAPPING ---
+        # Map new nflverse names back to our code's expected names
+        rename_dict = {
+            'player_display_name': 'player_name',
+            'team_abbr': 'recent_team'
+        }
+        weekly = weekly.rename(columns=rename_dict)
+        
+        # Ensure column exists before proceeding
+        if 'player_name' not in weekly.columns:
+            st.error("Critical Error: Player Name column not found in data feed.")
+            return pd.DataFrame()
+
+        # Clean strings
         weekly['player_name'] = weekly['player_name'].str.strip()
         weekly = weekly.dropna(subset=['player_name', 'position'])
         
-        # Hard-force numeric conversion to prevent "5.3" YAC mixups
+        # Force numeric conversion
         target_cols = ['passing_yards', 'rushing_yards', 'receiving_yards']
         for col in target_cols:
-            weekly[col] = pd.to_numeric(weekly[col], errors='coerce').fillna(0)
+            if col in weekly.columns:
+                weekly[col] = pd.to_numeric(weekly[col], errors='coerce').fillna(0)
             
         weekly['total_scrimmage_yards'] = weekly['rushing_yards'] + weekly['receiving_yards']
         
@@ -48,9 +62,16 @@ def load_nfl_data_pro():
         df = weekly.merge(sched[['season', 'week', 'home_team', 'temp', 'wind']], 
                           left_on=['season', 'week', 'recent_team'], right_on=['season', 'week', 'home_team'], how='left')
         return df.fillna(0)
-    except Exception: return pd.DataFrame()
+    except Exception as e: 
+        st.error(f"Data Load Error: {e}")
+        return pd.DataFrame()
 
 data = load_nfl_data_pro()
+
+# Check if data is empty before rendering UI
+if data.empty:
+    st.warning("Data sync in progress... Please refresh in a moment.")
+    st.stop()
 
 # --- 5. PLAYER DASHBOARD ---
 player_list = sorted(data['player_name'].unique())
@@ -63,23 +84,17 @@ target = 'passing_yards' if player_pos == 'QB' else 'total_scrimmage_yards'
 
 # --- 6. SMART PREDICTION ENGINE ---
 def get_sharp_prediction(df, player_name, target_stat):
-    # Train position-based model
     pos_data = df[df['position'] == player_pos].copy()
-    features = ['temp', 'wind'] # Simplified for stability
+    features = ['temp', 'wind']
     model = XGBRegressor(n_estimators=50).fit(pos_data[features], pos_data[target_stat])
     
-    # Current conditions
+    # Predict with baseline conditions
     raw_proj = model.predict(pd.DataFrame([[45, 10]], columns=features))[0]
     
-    # --- THE FALLBACK GUARDRAIL ---
-    # Jordan Love season avg is 225.4. If model says 5.3, this trigger fixes it.
+    # Season Average Fallback
     season_avg = player_subset[target_stat].mean()
-    recent_avg = player_subset[target_stat].tail(3).mean()
-    
-    # Logic: If projection is < 25% of their season average, it's a data error.
-    if raw_proj < (season_avg * 0.25):
-        return max(season_avg, recent_avg)
-    
+    if raw_proj < (season_avg * 0.3): # Catch 5.3/7.2 errors
+        return season_avg
     return raw_proj
 
 proj = get_sharp_prediction(data, selected_player, target)
@@ -100,6 +115,8 @@ with st.sidebar:
     st.header("🎟️ Your Parlay")
     for leg in st.session_state.parlay_legs:
         st.write(f"✅ {leg['Player']}: {leg['Prop']}")
-    if st.button("Clear"): st.session_state.parlay_legs = []; st.rerun()
+    if st.button("Clear"): 
+        st.session_state.parlay_legs = []
+        st.rerun()
 
 st.plotly_chart(px.line(player_subset, x='week', y=target, title="Season Trend"))
