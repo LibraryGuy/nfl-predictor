@@ -3,63 +3,58 @@ import nflreadpy as nfl
 import pandas as pd
 import plotly.express as px
 
-# --- 1. CORE CONFIG & SESSION ---
+# --- 1. CORE SETUP ---
 st.set_page_config(page_title="NFL Sharp Pro", layout="wide", page_icon="🏈")
 if "parlay_legs" not in st.session_state:
     st.session_state.parlay_legs = []
 
-# --- 2. THE DATA CURE (SMART COLUMN MAPPING) ---
+# --- 2. THE DATA CURE (WEATHER & LINES FIX) ---
 @st.cache_data(ttl=3600)
 def load_nfl_data_pro():
     try:
-        # Load Raw Data
+        # Load Player Stats & Schedules
         w_raw = nfl.load_player_stats(seasons=[2024, 2025]).to_pandas()
         s_raw = nfl.load_schedules(seasons=[2024, 2025]).to_pandas()
         
-        # --- THE FIX: FLATTEN AND AUTO-FIND COLUMNS ---
+        # --- FIX A: FLATTEN HEADERS ---
         for df in [w_raw, s_raw]:
-            # Flatten MultiIndex if it exists
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = ["_".join(filter(None, map(str, col))).strip() for col in df.columns.values]
-            else:
-                df.columns = [str(c).strip() for c in df.columns]
-            # Remove duplicates
+            df.columns = [str(c).strip() for c in df.columns]
             df = df.loc[:, ~df.columns.duplicated()].copy()
 
-        # --- SMART MAPPING: SEARCH FOR MISSING KEYS ---
-        # We look for ANY column that looks like Player Name or Team
-        def find_col(df, options):
-            for opt in options:
-                if opt in df.columns: return opt
-            # If not found, look for partial matches (e.g., 'player_name' inside 'offense_player_name')
-            for col in df.columns:
-                if any(opt in col.lower() for opt in options): return col
-            return None
-
-        # Re-assign keys to your dashboard's expected names
-        name_col = find_col(w_raw, ['player_name', 'player_display_name', 'player'])
-        team_col = find_col(w_raw, ['recent_team', 'team_abbr', 'team', 'posteam'])
-        yard_col = find_col(w_raw, ['passing_yards', 'pass_yards'])
-
-        if name_col: w_raw = w_raw.rename(columns={name_col: 'player_name'})
-        if team_col: w_raw = w_raw.rename(columns={team_col: 'recent_team'})
-        if yard_col: w_raw = w_raw.rename(columns={yard_col: 'passing_yards'})
-
-        # Final Cleaning for .str and Numeric
-        if 'player_name' in w_raw.columns:
-            w_raw['player_name'] = w_raw['player_name'].astype(str).str.strip()
-        if 'passing_yards' in w_raw.columns:
-            w_raw['passing_yards'] = pd.to_numeric(w_raw['passing_yards'], errors='coerce').fillna(0)
-
-        # Merge with Schedule (Syncing player stats with game conditions)
-        # We check for existence to prevent the KeyError: 'recent_team'
-        if 'recent_team' in w_raw.columns and 'home_team' in s_raw.columns:
-            df = w_raw.merge(s_raw, left_on=['season', 'week', 'recent_team'], 
-                             right_on=['season', 'week', 'home_team'], how='left')
-        else:
-            # Fallback merge if team names are still weird
-            df = w_raw 
+        # --- FIX B: THE "HOME/AWAY" WEATHER SYNC ---
+        # We create a lookup where every game exists for BOTH teams
+        s_home = s_raw.copy()
+        s_home['team'] = s_home['home_team']
+        s_home['opponent'] = s_home['away_team']
         
+        s_away = s_raw.copy()
+        s_away['team'] = s_away['away_team']
+        s_away['opponent'] = s_away['home_team']
+        # For away teams, the spread is reversed
+        if 'spread_line' in s_away.columns:
+            s_away['spread_line'] = s_away['spread_line'] * -1
+            
+        # Combine them so every team/week has a row with weather/lines
+        s_lookup = pd.concat([s_home, s_away], ignore_index=True)
+
+        # --- FIX C: DEFENSE RANKINGS ---
+        # Calculate Team Defense (Yards Allowed) from player stats
+        def_stats = w_raw.groupby(['season', 'week', 'recent_team'])['passing_yards'].sum().reset_index()
+        def_stats.columns = ['season', 'week', 'opponent', 'def_yards_allowed']
+
+        # --- FINAL MERGE ---
+        # 1. Map Player Stats to Team (recent_team)
+        w_raw = w_raw.rename(columns={'player_display_name': 'player_name', 'team_abbr': 'recent_team'})
+        
+        # 2. Join Player Stats + Weather/Lines (s_lookup)
+        df = w_raw.merge(s_lookup, left_on=['season', 'week', 'recent_team'], 
+                         right_on=['season', 'week', 'team'], how='left')
+        
+        # 3. Join with Defense Data (Against the Opponent)
+        df = df.merge(def_stats, on=['season', 'week', 'opponent'], how='left')
+
         return df.fillna(0)
     except Exception as e:
         st.error(f"Critical Sync Failure: {str(e)}")
@@ -67,7 +62,7 @@ def load_nfl_data_pro():
 
 data = load_nfl_data_pro()
 
-# --- 3. SIDEBAR (UNCHANGED DASHBOARD FEATURES) ---
+# --- 3. SIDEBAR (UNCHANGED FEATURES) ---
 with st.sidebar:
     st.title("🏈 NFL Sharp Pro")
     if not data.empty and 'player_name' in data.columns:
@@ -88,27 +83,31 @@ with st.sidebar:
                 st.session_state.parlay_legs = []
                 st.rerun()
 
-# --- 4. MAIN DASHBOARD (RETAINED LAYOUT) ---
+# --- 4. MAIN DASHBOARD (RETAINED & EXPANDED) ---
 if not data.empty:
     p_data = data[data['player_name'] == selected_player].sort_values(by=['season', 'week'])
     if not p_data.empty:
         latest = p_data.iloc[-1]
         st.header(f"📊 {selected_player} Analytics")
         
-        # Original 4-metric row
+        # Row 1: Metrics (Weather & Betting Lines now fixed)
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Season Avg", f"{p_data['passing_yards'].mean():.1f} Yds")
-        m2.metric("Temp", f"{latest.get('temp', 'N/A')}°F")
+        m2.metric("Temp", f"{latest.get('temp', 70)}°F") # Domes default to 70
         m3.metric("Wind", f"{latest.get('wind', 0)} mph")
-        m4.metric("Spread", latest.get('spread_line', 'N/A'))
+        m4.metric("Spread", f"{latest.get('spread_line', 0)}")
+
+        # Row 2: Defense Option
+        st.subheader(f"🛡️ Matchup vs {latest.get('opponent', 'Opponent')}")
+        d_avg = latest.get('def_yards_allowed', 0)
+        st.progress(min(d_avg / 400, 1.0), text=f"Opponent Allowing {d_avg:.0f} Pass Yds this week")
 
         # Trend Chart
         st.plotly_chart(px.line(p_data, x='week', y='passing_yards', markers=True, 
                                 title="Weekly Performance Trend"), use_container_width=True)
         
-        # Footer
-        st.info(f"🏟️ Surface: {str(latest.get('surface', 'Turf')).title()} | 📉 O/U: {latest.get('total_line', 'N/A')}")
+        st.info(f"🏟️ Roof: {str(latest.get('roof', 'Outdoors')).title()} | 📉 O/U: {latest.get('total_line', 'N/A')}")
     else:
-        st.warning("Player stats identified, but no specific game records found.")
+        st.warning("Player found, but no game history is available.")
 else:
     st.warning("Dashboard syncing... please refresh in 30 seconds.")
