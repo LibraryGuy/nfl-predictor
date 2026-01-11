@@ -8,7 +8,7 @@ st.set_page_config(page_title="NFL Sharp Pro", layout="wide", page_icon="🏈")
 if "parlay_legs" not in st.session_state:
     st.session_state.parlay_legs = []
 
-# --- 2. DATA LOADING (THE PERMANENT FIX) ---
+# --- 2. DATA LOADING (THE PERMANENT FLATTEN FIX) ---
 @st.cache_data(ttl=3600)
 def load_nfl_data_pro():
     try:
@@ -16,26 +16,25 @@ def load_nfl_data_pro():
         w_raw = nfl.load_player_stats(seasons=[2024, 2025]).to_pandas()
         s_raw = nfl.load_schedules(seasons=[2024, 2025]).to_pandas()
         
-        # --- NUCLEAR FIX: REMOVE MULTI-LEVEL HEADERS ---
-        # This takes ('player', 'player_name') and turns it into 'player_name'
+        # --- THE FIX: REMOVE MULTI-LEVEL HEADERS ---
+        # This converts [('player', 'player_name')] into 'player_name'
         # This is what stops the 'DataFrame' object has no attribute 'str' error!
         for df in [w_raw, s_raw]:
             if isinstance(df.columns, pd.MultiIndex):
-                # We drop the category (e.g., 'offense') and keep the stat name
+                # We drop the top level and keep only the bottom stat name
                 df.columns = df.columns.get_level_values(-1)
-            # Remove any unintended spaces or formatting
+            # Remove any unintended spaces or non-string types
             df.columns = [str(c).strip() for c in df.columns]
 
         # --- RE-MAPPING TO YOUR ORIGINAL VARIABLES ---
-        # Map the 2026 data names back to your dashboard's logic
+        # The library uses deep names; we force them back to your logic.
         col_map = {
             'player_display_name': 'player_name',
             'team_abbr': 'recent_team'
         }
         w_raw = w_raw.rename(columns=col_map)
 
-        # Force 'player_name' to be a clean string column
-        # This WILL NOT fail now because the index is flattened
+        # Now 'player_name' is a 1D column (Series). .str WILL work now.
         if 'player_name' in w_raw.columns:
             w_raw['player_name'] = w_raw['player_name'].astype(str).str.strip()
         
@@ -43,13 +42,13 @@ def load_nfl_data_pro():
         if 'passing_yards' in w_raw.columns:
             w_raw['passing_yards'] = pd.to_numeric(w_raw['passing_yards'], errors='coerce').fillna(0)
 
-        # Merge with Schedule (preserving weather and line data)
+        # Merge with Schedule (Weather, Lines, Field)
         df = w_raw.merge(s_raw, left_on=['season', 'week', 'recent_team'], 
                          right_on=['season', 'week', 'home_team'], how='left')
         
         return df.fillna(0)
     except Exception as e:
-        st.error(f"Critical Failure: {str(e)}")
+        st.error(f"Syncing Error: {str(e)}")
         return pd.DataFrame()
 
 data = load_nfl_data_pro()
@@ -74,14 +73,14 @@ with st.sidebar:
                 st.session_state.parlay_legs = []
                 st.rerun()
 
-# --- 4. MAIN DASHBOARD (ALL FEATURES PRESERVED) ---
+# --- 4. MAIN DASHBOARD (RETAINED LAYOUT) ---
 if not data.empty:
     p_data = data[data['player_name'] == selected_player]
     if not p_data.empty:
         latest = p_data.iloc[-1]
         st.header(f"📊 {selected_player} Analytics")
         
-        # The 4-metric row you rely on
+        # Original 4-metric row
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Season Avg", f"{p_data['passing_yards'].mean():.1f} Yds")
         m2.metric("Temp", f"{latest.get('temp', 'N/A')}°F")
@@ -92,9 +91,7 @@ if not data.empty:
         st.plotly_chart(px.line(p_data, x='week', y='passing_yards', markers=True, 
                                 title="Weekly Performance Trend"), use_container_width=True)
         
-        # Footer info
-        st.info(f"🏟️ Surface: {str(latest.get('surface', 'Turf')).title()} | 📉 O/U: {latest.get('total_line', 'N/A')}")
-    else:
-        st.warning("No data found for this player.")
+        # Footer
+        st.info(f"🏟️ Surface: {str(latest.get('surface', 'Turf')).title()} | 📉 O/U Total: {latest.get('total_line', 'N/A')}")
 else:
-    st.warning("Syncing... please refresh in 30 seconds.")
+    st.warning("Dashboard syncing... please refresh in 30 seconds.")
