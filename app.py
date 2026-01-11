@@ -3,48 +3,49 @@ import nflreadpy as nfl
 import pandas as pd
 import plotly.express as px
 
-# --- 1. CORE CONFIG & PARLAY SLIP ---
+# --- 1. CORE CONFIG & SESSION ---
 st.set_page_config(page_title="NFL Sharp Pro", layout="wide", page_icon="🏈")
 if "parlay_legs" not in st.session_state:
     st.session_state.parlay_legs = []
 
-# --- 2. THE DATA CURE (TOTAL COLUMN REBUILD) ---
+# --- 2. THE DATA CURE (TOTAL REBUILD) ---
 @st.cache_data(ttl=3600)
 def load_nfl_data_pro():
     try:
-        # Load Raw Data for current season context (Jan 2026)
+        # Load Raw Data (Polars to Pandas)
         w_raw = nfl.load_player_stats(seasons=[2024, 2025]).to_pandas()
         s_raw = nfl.load_schedules(seasons=[2024, 2025]).to_pandas()
         
-        # --- THE FIX: NUCLEAR COLUMN STRIPPING ---
-        # This replaces MultiIndex or Tuples with clean, single-level strings.
+        # --- THE FIX: NUCLEAR COLUMN REBUILD ---
+        # This welds hierarchical headers like ('player', 'player_name') into 'player_player_name'
+        # This is the ONLY way to stop the 'DataFrame has no attribute str' error.
         for df in [w_raw, s_raw]:
-            # We join nested levels with an underscore and strip spaces
-            df.columns = ["_".join(filter(None, map(str, col))).strip() 
-                          if isinstance(col, tuple) else str(col).strip() 
-                          for col in df.columns.values]
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = ['_'.join(filter(None, map(str, col))).strip() for col in df.columns.values]
+            else:
+                df.columns = [str(c).strip() for c in df.columns]
 
-        # --- RE-MAPPING TO ORIGINAL KEYS ---
-        # We map the new 2026 names back to the variables your dashboard expects
+        # --- RE-MAPPING TO YOUR ORIGINAL DASHBOARD KEYS ---
+        # We find the new 2026 names and map them to your variables
         col_map = {
             'player_player_name': 'player_name',
             'player_display_name': 'player_name',
             'team_recent_team': 'recent_team',
             'team_team_abbr': 'recent_team',
-            'passing_passing_yards': 'passing_yards', # The real total yards
-            'offense_passing_yards': 'passing_yards'  # Alternate source
+            'passing_passing_yards': 'passing_yards', # Targets TOTAL yards
+            'offense_passing_yards': 'passing_yards'  # Prevents '5.3 yard' glitch
         }
         w_raw = w_raw.rename(columns=col_map)
 
-        # Force 'player_name' to be a clean Series (stops the .str error)
+        # Now 'player_name' is a 1D column (Series). .str WILL work.
         if 'player_name' in w_raw.columns:
             w_raw['player_name'] = w_raw['player_name'].astype(str).str.strip()
         
-        # Ensure yards are numeric (prevents the '5.3 yard' average glitch)
+        # Ensure yards are numeric (secondary safety for Jordan Love glitch)
         if 'passing_yards' in w_raw.columns:
             w_raw['passing_yards'] = pd.to_numeric(w_raw['passing_yards'], errors='coerce').fillna(0)
 
-        # Merge with Schedule (using season, week, and team)
+        # Merge with Schedule (Weather, Lines, Field)
         df = w_raw.merge(s_raw, left_on=['season', 'week', 'recent_team'], 
                          right_on=['season', 'week', 'home_team'], how='left')
         
@@ -55,7 +56,7 @@ def load_nfl_data_pro():
 
 data = load_nfl_data_pro()
 
-# --- 3. SIDEBAR (UNCHANGED DASHBOARD FEATURES) ---
+# --- 3. SIDEBAR (UNTOUCHED FEATURES) ---
 with st.sidebar:
     st.title("🏈 NFL Sharp Pro")
     if not data.empty and 'player_name' in data.columns:
@@ -83,7 +84,7 @@ if not data.empty:
         latest = p_data.iloc[-1]
         st.header(f"📊 {selected_player} Analytics")
         
-        # Metric Row: Season Avg, Temp, Wind, Spread
+        # Original 4-metric row
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Season Avg", f"{p_data['passing_yards'].mean():.1f} Yds")
         m2.metric("Temp", f"{latest.get('temp', 'N/A')}°F")
@@ -95,8 +96,8 @@ if not data.empty:
                                 title="Weekly Performance Trend"), use_container_width=True)
         
         # Footer Detail Box
-        st.info(f"🏟️ Surface: {str(latest.get('surface', 'Turf')).title()} | 📉 O/U: {latest.get('total_line', 'N/A')}")
+        st.info(f"🏟️ Surface: {str(latest.get('surface', 'Turf')).title()} | 📉 O/U Total: {latest.get('total_line', 'N/A')}")
     else:
-        st.warning("Data sync complete, but no stats found for this specific player.")
+        st.warning("Data sync complete, but no performance records found for this selection.")
 else:
     st.warning("Dashboard syncing... please refresh in 30 seconds.")
