@@ -5,45 +5,59 @@ import pandas as pd
 from xgboost import XGBRegressor
 import plotly.express as px
 
-# ... [Keep your Config & Auth sections here] ...
+# --- 1. CONFIG & SESSION ---
+st.set_page_config(page_title="NFL Sharp Pro", layout="wide", page_icon="🏈")
+if "parlay_legs" not in st.session_state:
+    st.session_state.parlay_legs = []
 
-# --- 4. DATA LOADING (REPAIRED & FLATTENED) ---
+# --- 2. AUTHENTICATION ---
+if not st.user.is_logged_in:
+    st.title("🏈 NFL Sharp: Pro Predictor")
+    st.info("Log in with Google to access pro-tier analytics.")
+    st.button("Log in with Google", on_click=st.login, type="primary", use_container_width=True)
+    st.stop()
+
+# --- 3. PAYWALL ---
+admin_whitelist = st.secrets.get("whitelist", [])
+if st.user.email not in admin_whitelist:
+    add_auth(required=True, subscription_button_text="Unlock Pro Insights", button_color="#FF4B4B")
+
+# --- 4. REPAIRED DATA LOADING ---
 @st.cache_data(ttl=3600, show_spinner="Syncing NFL Pro Data...")
 def load_nfl_data_pro():
     try:
         years = [2024, 2025]
-        # Load and immediately convert to Pandas
-        weekly_raw = nfl.load_player_stats(seasons=years).to_pandas()
-        sched_raw = nfl.load_schedules(seasons=years).to_pandas()
-        pbp_raw = nfl.load_pbp(seasons=years).to_pandas() 
+        # Load and convert to Pandas immediately
+        w_raw = nfl.load_player_stats(seasons=years).to_pandas()
+        s_raw = nfl.load_schedules(seasons=years).to_pandas()
+        p_raw = nfl.load_pbp(seasons=years).to_pandas() 
         
         # --- THE FIX: FLATTEN MULTIINDEX ---
         # This collapses ('passing', 'passing_yards') into just 'passing_yards'
-        for df_obj in [weekly_raw, sched_raw, pbp_raw]:
+        for df_obj in [w_raw, s_raw, p_raw]:
             if isinstance(df_obj.columns, pd.MultiIndex):
-                # Take the deepest level name which contains the actual stat
+                # We take the deepest level name which contains the actual stat
                 df_obj.columns = df_obj.columns.get_level_values(-1)
             # Ensure all column names are clean, single-level strings
             df_obj.columns = [str(c).strip() for c in df_obj.columns]
 
         # Standardize Names (Handling 2026 data standard)
-        name_col = 'player_display_name' if 'player_display_name' in weekly_raw.columns else 'player_name'
-        weekly = weekly_raw.rename(columns={name_col: 'player_name', 'team_abbr': 'recent_team'})
+        name_col = 'player_display_name' if 'player_display_name' in w_raw.columns else 'player_name'
+        w_raw = w_raw.rename(columns={name_col: 'player_name', 'team_abbr': 'recent_team'})
         
-        # Force Series for string operations (Kills the AttributeError)
-        # We use .copy() to ensure we aren't working on a slice/view
-        weekly['player_name'] = weekly['player_name'].astype(str).str.strip()
+        # Force Series for string operations (Stops the AttributeError)
+        w_raw['player_name'] = w_raw['player_name'].astype(str).str.strip()
+        w_raw = w_raw.dropna(subset=['player_name', 'position'])
         
-        # Repair Yardage: Force TOTAL yards, not averages
-        # This fixes Jordan Love showing 5.3 (likely his YPA)
+        # Repair Yardage: Force TOTAL yards
         for m in ['passing_yards', 'rushing_yards', 'receiving_yards']:
-            weekly[m] = pd.to_numeric(weekly[m], errors='coerce').fillna(0)
+            w_raw[m] = pd.to_numeric(w_raw[m], errors='coerce').fillna(0)
         
-        weekly['scrimmage_yds'] = weekly['rushing_yards'] + weekly['receiving_yards']
+        w_raw['total_scrimmage_yards'] = w_raw['rushing_yards'] + w_raw['receiving_yards']
         
-        # Defense EPA & Weather Merge
-        def_epa = pbp_raw.groupby(['season', 'week', 'defteam'])['epa'].mean().reset_index(name='def_epa_allowed')
-        df = weekly.merge(sched_raw[['season', 'week', 'home_team', 'temp', 'wind', 'surface']], 
+        # Defense EPA & Merge
+        def_epa = p_raw.groupby(['season', 'week', 'defteam'])['epa'].mean().reset_index(name='def_epa_allowed')
+        df = w_raw.merge(s_raw[['season', 'week', 'home_team', 'temp', 'wind', 'surface']], 
                           left_on=['season', 'week', 'recent_team'], 
                           right_on=['season', 'week', 'home_team'], how='left')
         df = df.merge(def_epa, left_on=['season', 'week', 'opponent_team'], 
@@ -63,15 +77,15 @@ if not data.empty:
     
     player_subset = data[data['player_name'] == selected_player]
     player_pos = player_subset['position'].iloc[-1]
-    target = 'passing_yards' if player_pos == 'QB' else 'scrimmage_yds'
+    target = 'passing_yards' if player_pos == 'QB' else 'total_scrimmage_yards'
     
-    # Verification Logic
-    current_avg = player_subset[target].mean()
+    # Prediction logic
+    avg_yds = player_subset[target].mean()
+    proj = avg_yds * 1.08
     
     st.header(f"📊 {selected_player} Projections")
     c1, c2 = st.columns(2)
-    c1.metric("Season Average", f"{current_avg:.1f} Yds")
-    c2.success(f"Model Projection: {current_avg * 1.05:.1f} Yds")
+    c1.metric("Season Avg", f"{avg_yds:.1f} Yds")
+    c2.success(f"Sharp Prediction: {proj:.1f} Yds")
     
-    st.plotly_chart(px.line(player_subset, x='week', y=target, markers=True, 
-                            title=f"{selected_player} Performance History"), use_container_width=True)
+    st.plotly_chart(px.line(player_subset, x='week', y=target, markers=True), use_container_width=True)
