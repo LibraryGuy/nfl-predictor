@@ -29,7 +29,7 @@ if not data.empty:
     # Sidebar Selections
     with st.sidebar:
         st.header("🎯 Target Selection")
-        selected_p = st.selectbox("Select Player", sorted(data['player_name'].unique()))
+player_list = sorted(data['player_name'].iloc[:, 0].unique()) if isinstance(data['player_name'], pd.DataFrame) else sorted(data['player_name'].unique())
         selected_opp = st.selectbox("Opponent Defense", sorted(data['opponent'].unique()))
         sel_stad = st.selectbox("Game Venue", sorted(stadium_client.get_list_of_stadium_names()))
         market_line = st.number_input("Sportsbook Line", value=0.0, step=0.5)
@@ -98,3 +98,4 @@ if not data.empty:
     # Bottom Row: Advanced Table
     with st.expander("📂 Raw Matchup Data & Splits"):
         st.dataframe(p_df[['week', 'opponent', stat_col, 'receptions', 'team']].tail(10), use_container_width=True)
+
