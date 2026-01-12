@@ -8,6 +8,18 @@ from nfl_stadiums import NFLStadiums
 # --- 1. SETTINGS & DATA ---
 st.set_page_config(page_title="NFL Sharp: Intelligence Hub", layout="wide", page_icon="🏈")
 
+# Hardcoded 2025 League Averages for SOS Logic
+# League Avg Pass Yds Allowed: ~210 | Rush Yds Allowed: ~115
+DEF_STATS_2025 = {
+    'HOU': {'pass_adj': 0.87, 'rush_adj': 0.81}, # Elite Defense
+    'DEN': {'pass_adj': 0.89, 'rush_adj': 0.79},
+    'CLE': {'pass_adj': 0.80, 'rush_adj': 1.01}, # Elite Pass Defense
+    'DAL': {'pass_adj': 1.19, 'rush_adj': 1.09}, # Vulnerable Defense
+    'BAL': {'pass_adj': 1.18, 'rush_adj': 0.92},
+    'JAX': {'pass_adj': 1.04, 'rush_adj': 0.74}, # Elite Run Stuffers
+    'CIN': {'pass_adj': 1.11, 'rush_adj': 1.27}, # Very Vulnerable
+}
+
 @st.cache_data(ttl=3600)
 def load_data_pro():
     try:
@@ -54,44 +66,45 @@ if not data.empty:
             options=["Defensive Struggle", "Balanced", "Shootout"],
             value="Balanced"
         )
-        # Script Multipliers
         script_boost = {"Defensive Struggle": 0.90, "Balanced": 1.0, "Shootout": 1.15}
-        multiplier = script_boost[game_script]
-
+        
     p_df = data[data['player_name'] == selected_p].copy()
     
     if not p_df.empty:
         p_pos = p_df['position'].iloc[-1]
         
         stat_map = {
-            'QB': ('passing_yards', 'Pass Yds'),
-            'RB': ('rushing_yards', 'Rush Yds'),
-            'WR': ('receiving_yards', 'Rec Yds'),
-            'TE': ('receiving_yards', 'Rec Yds')
+            'QB': ('passing_yards', 'Pass Yds', 'pass_adj'),
+            'RB': ('rushing_yards', 'Rush Yds', 'rush_adj'),
+            'WR': ('receiving_yards', 'Rec Yds', 'pass_adj'),
+            'TE': ('receiving_yards', 'Rec Yds', 'pass_adj')
         }
-        stat_col, stat_label = stat_map.get(p_pos, ('receiving_yards', 'Yds'))
+        stat_col, stat_label, adj_key = stat_map.get(p_pos, ('receiving_yards', 'Yds', 'pass_adj'))
 
         # Calculations
         hist_avg = p_df[stat_col].mean()
         last_3_avg = p_df[stat_col].tail(3).mean()
         
-        # --- IMPROVED TD LOGIC: QB vs SKILL ---
+        # --- SOS LOGIC ---
+        # Get defense multiplier (Default to 1.0 if team not in our 'Elite/Vulnerable' list)
+        sos_multiplier = DEF_STATS_2025.get(selected_opp, {}).get(adj_key, 1.0)
+        sos_impact = (sos_multiplier - 1) * 100
+        
+        # --- QB vs SKILL TD LOGIC ---
         if p_pos == 'QB':
             td_col = 'passing_tds'
-            td_threshold = 1.5
-            td_market_label = "1.5+ Pass TDs"
+            td_threshold, td_market_label = 1.5, "1.5+ Pass TDs"
         else:
             p_df['total_tds'] = p_df['rushing_tds'] + p_df['receiving_tds']
             td_col = 'total_tds'
-            td_threshold = 0.5
-            td_market_label = "Anytime TD"
+            td_threshold, td_market_label = 0.5, "Anytime TD"
 
         games_played = len(p_df)
         td_hit_count = len(p_df[p_df[td_col] >= td_threshold])
         td_prob = (td_hit_count / games_played) * 100 if games_played > 0 else 0
         
-        # Apply Game Script Multiplier to Projection
-        model_proj = (hist_avg * 1.10) * multiplier 
+        # PROJECTION: Hist Avg * Genius Boost (1.1) * Game Script * SOS Multiplier
+        model_proj = (hist_avg * 1.10) * script_boost[game_script] * sos_multiplier
         
         # Market Math
         if market_odds < 0:
@@ -104,26 +117,29 @@ if not data.empty:
 
         # --- 3. THE DASHBOARD ---
         st.title(f"📊 {selected_p} Intelligence Hub")
-        st.markdown(f"**Position:** {p_pos} | **Matchup:** vs {selected_opp} | **Venue:** {sel_stad}")
+        
+        # SOS Alert Banner
+        if sos_multiplier < 0.95:
+            st.error(f"⚠️ **Tough Matchup:** {selected_opp} defense reduces {stat_label} expectations by {abs(sos_impact):.1f}%")
+        elif sos_multiplier > 1.05:
+            st.success(f"🚀 **Green Light:** {selected_opp} defense increases {stat_label} expectations by {sos_impact:.1f}%")
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Season Average", f"{hist_avg:.1f}")
-        m2.metric("L3 Game Trend", f"{last_3_avg:.1f}", delta=f"{last_3_avg - hist_avg:+.1f}")
-        m3.metric("Model Projection", f"{model_proj:.1f}", delta=f"{game_script} Mode")
-        m4.metric("Market Edge (EV)", f"{ev_edge:+.1f}%", 
-                  delta="POS VALUE" if ev_edge > 0 else "BAD VALUE",
-                  delta_color="normal" if ev_edge > 0 else "inverse")
+        m2.metric("SOS Difficulty", f"{sos_multiplier}x", delta=f"{sos_impact:+.1f}% vs Avg")
+        m3.metric("Model Projection", f"{model_proj:.1f}")
+        m4.metric("Market Edge (EV)", f"{ev_edge:+.1f}%", delta="POS VALUE" if ev_edge > 0 else "BAD VALUE", delta_color="normal" if ev_edge > 0 else "inverse")
 
         st.divider()
 
         col_left, col_right = st.columns([2, 1])
         with col_left:
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=p_df['week'], y=p_df[stat_col], name="Actuals", line=dict(color='#00c8ff', width=3)))
-            fig.add_hline(y=model_proj, line_dash="dash", line_color="#ff4b4b", annotation_text=f"Model ({game_script})")
+            fig.add_trace(go.Scatter(x=p_df.index, y=p_df[stat_col], name="Actuals", line=dict(color='#00c8ff', width=3)))
+            fig.add_hline(y=model_proj, line_dash="dash", line_color="#ff4b4b", annotation_text="Final Projection (SOS Incl.)")
             if market_line > 0:
                 fig.add_hline(y=market_line, line_dash="dot", line_color="yellow", annotation_text="Market Line")
-            fig.update_layout(title=f"{stat_label} Performance vs. Projections", template="plotly_dark")
+            fig.update_layout(title=f"{stat_label} Trend + SOS Adjustment", template="plotly_dark")
             st.plotly_chart(fig, use_container_width=True)
 
         with col_right:
@@ -131,21 +147,15 @@ if not data.empty:
             st.write(f"**Market Hit Rate:** {hit_rate:.1f}%")
             st.progress(hit_rate / 100)
             
-            # Dynamic TD Gauge based on Position
             st.write(f"**{td_market_label} Prob:** {td_prob:.1f}%")
             st.progress(td_prob / 100)
             st.caption(f"Cleared {td_threshold} in {td_hit_count}/{games_played} games.")
             
             st.divider()
-            
             st.success(f"**Genius Leg:**\n{selected_p} OVER {round(model_proj * 0.85)}+ {stat_label}")
-            if ev_edge > 5:
-                st.info(f"💎 **Math Edge:** Found value against house odds.")
-            if td_prob > 60:
-                st.warning(f"🔥 **High Value Add:** {selected_p} {td_market_label}")
+            if ev_edge > 5: st.info(f"💎 **Math Edge:** Your probability is higher than the house.")
 
         with st.expander("📂 Raw Matchup Data & Splits"):
-            display_cols = ['week', 'opponent', stat_col, td_col, 'team']
-            st.dataframe(p_df[display_cols].tail(10), use_container_width=True)
+            st.dataframe(p_df[['week', 'opponent', stat_col, td_col]].tail(10), use_container_width=True)
 else:
     st.error("Data Load Error: Please check connectivity.")
