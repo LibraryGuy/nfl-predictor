@@ -12,6 +12,7 @@ st.set_page_config(page_title="NFL Sharp: Intelligence Hub", layout="wide", page
 @st.cache_data(ttl=3600)
 def load_data_pro():
     try:
+        # Loading 2024 and 2025 seasons
         df = nfl.load_player_stats(seasons=[2024, 2025]).to_pandas()
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = ["_".join(filter(None, map(str, col))).strip() for col in df.columns.values]
@@ -20,12 +21,15 @@ def load_data_pro():
         df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
         
         # --- BULLETPROOF FIX 1: DEDUPLICATE COLUMNS ---
-        # This prevents AttributeError when calling data['player_name']
         df = df.loc[:, ~df.columns.duplicated()].copy()
         
-        for col in ['passing_yards', 'rushing_yards', 'receiving_yards', 'receptions']:
+        # Ensure all necessary stat columns exist
+        stat_cols = ['passing_yards', 'rushing_yards', 'receiving_yards', 'receptions', 
+                     'passing_tds', 'rushing_tds', 'receiving_tds']
+        for col in stat_cols:
             if col not in df.columns: df[col] = 0
             df[col] = df[col].fillna(0)
+            
         return df.dropna(subset=['player_name', 'opponent', 'position'])
     except Exception as e:
         st.error(f"Sync Failure: {e}")
@@ -36,21 +40,18 @@ stadium_client = NFLStadiums()
 
 # --- 2. THE INTELLIGENCE ENGINE ---
 if not data.empty:
-    # Sidebar Selections
     with st.sidebar:
         st.header("🎯 Target Selection")
         
         # --- BULLETPROOF FIX 2: SAFE LIST GENERATION ---
         player_list = sorted(data['player_name'].unique())
         
-        # Define variables HERE before they are used in the main body
         selected_p = st.selectbox("Select Player", player_list)
         selected_opp = st.selectbox("Opponent Defense", sorted(data['opponent'].unique()))
         sel_stad = st.selectbox("Game Venue", sorted(stadium_client.get_list_of_stadium_names()))
         market_line = st.number_input("Sportsbook Line", value=0.0, step=0.5)
 
     # --- BULLETPROOF FIX 3: EXECUTION ORDER ---
-    # Now that selected_p is defined above, this filter will not cause a NameError
     p_df = data[data['player_name'] == selected_p].copy()
     
     if not p_df.empty:
@@ -68,6 +69,19 @@ if not data.empty:
         # Calculate Multi-Point Metrics
         hist_avg = p_df[stat_col].mean()
         last_3_avg = p_df[stat_col].tail(3).mean()
+        
+        # --- TD PROBABILITY LOGIC ---
+        if p_pos == 'QB':
+            # Use passing_tds for QBs
+            td_col = 'passing_tds'
+        else:
+            # Create a combined TD column for skill positions
+            p_df['total_tds'] = p_df['rushing_tds'] + p_df['receiving_tds']
+            td_col = 'total_tds'
+
+        games_played = len(p_df)
+        td_games = len(p_df[p_df[td_col] >= 1])
+        td_prob = (td_games / games_played) * 100 if games_played > 0 else 0
         
         # Model Projection
         model_proj = hist_avg * 1.10 
@@ -98,11 +112,28 @@ if not data.empty:
             st.plotly_chart(fig, use_container_width=True)
 
         with col_right:
-            st.subheader("🎯 Consistency Profile")
+            # --- UPDATED DASHBOARD UI ---
+            st.subheader("🎯 Intelligence Gauges")
+            
+            # Gauge 1: Yardage Reliability
             hit_80 = (p_df[stat_col] >= (model_proj * 0.8)).mean() * 100
-            st.write(f"**Reliability Score:** {hit_80:.1f}%")
+            st.write(f"**Yardage Reliability:** {hit_80:.1f}%")
             st.progress(hit_80 / 100)
+            
+            # Gauge 2: TD Probability
+            st.write(f"**TD Probability (Any):** {td_prob:.1f}%")
+            st.progress(td_prob / 100)
+            st.caption(f"Scored in {td_games} of {games_played} games.")
+            
+            st.divider()
+            
+            # Genius Parlay Recommendation
             st.success(f"**Genius Leg:**\n{selected_p} OVER {round(model_proj * 0.85)}+ {stat_label}")
+            if td_prob > 60:
+                st.warning(f"🔥 **High Value Add:** {selected_p} Anytime TD")
 
         with st.expander("📂 Raw Matchup Data & Splits"):
-            st.dataframe(p_df[['week', 'opponent', stat_col, 'receptions', 'team']].tail(10), use_container_width=True)
+            display_cols = ['week', 'opponent', stat_col, td_col, 'team']
+            st.dataframe(p_df[display_cols].tail(10), use_container_width=True)
+else:
+    st.error("Data Load Error: Please check your data source connectivity.")
