@@ -47,11 +47,10 @@ if not data.empty:
         selected_p = st.selectbox("Select Player", sorted(data['player_name'].unique()))
         selected_opp = st.selectbox("Opponent Defense", sorted(data['opponent'].unique()))
         
-        # --- AUTOMATED VENUE LOGIC ---
         sel_stad_name = st.selectbox("Game Venue", sorted(stadium_client.get_list_of_stadium_names()))
         stad_data = stadium_client.get_stadium_by_name(sel_stad_name)
         
-        roof_type = stad_data.get('roof_type', 'Outdoor').lower()
+        roof_type = stad_data.get('roof_type', 'Outdoor').lower() if stad_data else 'outdoor'
         is_indoor = any(x in roof_type for x in ['dome', 'indoor', 'retractable'])
         
         st.divider()
@@ -64,16 +63,26 @@ if not data.empty:
         public_tickets = st.slider("% of Total Bets (Tickets)", 0, 100, 70)
         sharp_money = st.slider("% of Total Cash (Handle)", 0, 100, 45)
 
+        # --- NEW: INJURY IMPACT MULTIPLIER ---
+        st.divider()
+        st.subheader("🏥 Injury Impact")
+        teammate_out = st.checkbox("Key Teammate is OUT", help="Increases target/carry share for selected player.")
+        injury_severity = st.select_slider(
+            "Impact Level", 
+            options=["Low (WR3/RB3)", "Medium (WR2/RB2)", "High (WR1/RB1)"],
+            value="Medium (WR2/RB2)",
+            disabled=not teammate_out
+        )
+
         st.divider()
         st.subheader("🎬 Game Script Engine")
         game_script = st.select_slider("Expected Flow", options=["Defensive Struggle", "Balanced", "Shootout"], value="Balanced")
 
-    # --- 3. BULLETPROOF WEATHER ENGINE (FIXED) ---
+    # --- 3. WEATHER ENGINE ---
     with st.spinner(f"Analyzing conditions at {sel_stad_name}..."):
         try:
             today_str = datetime.now().strftime("%Y-%m-%d")
             forecast = stadium_client.get_weather_forecast_for_stadium(sel_stad_name, today_str)
-            
             if is_indoor or not forecast:
                 wind_speed, precip_prob = 0, 0
             else:
@@ -83,7 +92,6 @@ if not data.empty:
                 wind_speed = sum(wind_list[:8]) / 8 if wind_list else 5
                 precip_prob = max(precip_list[:8]) if precip_list else 0
         except Exception:
-            # Fallback to safe defaults if API fails
             wind_speed, precip_prob = 5, 0
 
     p_df = data[data['player_name'] == selected_p].copy()
@@ -99,6 +107,11 @@ if not data.empty:
         sos_multiplier = DEF_STATS_2025.get(selected_opp, {}).get(adj_key, 1.0)
         script_boost = {"Defensive Struggle": 0.90, "Balanced": 1.0, "Shootout": 1.15}[game_script]
         
+        # --- CALC: INJURY MULTIPLIER ---
+        injury_mult = 1.0
+        if teammate_out:
+            injury_mult = {"Low (WR3/RB3)": 1.08, "Medium (WR2/RB2)": 1.15, "High (WR1/RB1)": 1.25}[injury_severity]
+
         # Weather Adjustments
         weather_multiplier = 1.0
         if not is_indoor:
@@ -108,7 +121,8 @@ if not data.empty:
             elif p_pos == 'RB' and precip_prob > 50: 
                 weather_multiplier *= 1.05
 
-        model_proj = (hist_avg * 1.10) * script_boost * sos_multiplier * weather_multiplier
+        # Final Projection
+        model_proj = (hist_avg * 1.10) * script_boost * sos_multiplier * weather_multiplier * injury_mult
         
         # Market Math
         implied_prob = (abs(market_odds)/(abs(market_odds)+100))*100 if market_odds < 0 else (100/(market_odds+100))*100
@@ -119,18 +133,18 @@ if not data.empty:
         # --- 4. THE DASHBOARD ---
         st.title(f"📊 {selected_p} Intelligence Hub")
         
-        # Alert Triage
         a1, a2, a3 = st.columns(3)
         with a1:
             st.info(f"🏟️ Venue: {roof_type.title()}")
         with a2:
             st.warning(f"🌬️ Wind: {wind_speed:.1f} MPH") if wind_speed > 12 else st.write("🌬️ Calm Winds")
         with a3:
-            if money_delta > 15: st.success("💎 SHARP SIGNAL DETECTED")
+            if teammate_out: st.error(f"🚑 INJURY BOOST ACTIVE: {injury_mult}x")
+            elif money_delta > 15: st.success("💎 SHARP SIGNAL DETECTED")
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Season Average", f"{hist_avg:.1f}")
-        m2.metric("Total Multiplier", f"{sos_multiplier * script_boost * weather_multiplier:.2f}x")
+        m2.metric("Total Multiplier", f"{sos_multiplier * script_boost * weather_multiplier * injury_mult:.2f}x")
         m3.metric("Model Projection", f"{model_proj:.1f}")
         m4.metric("Market Edge (EV)", f"{ev_edge:+.1f}%", delta="VALUE" if ev_edge > 0 else "NO VALUE")
 
@@ -140,13 +154,14 @@ if not data.empty:
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=p_df.index, y=p_df[stat_col], name="Actuals", line=dict(color='#00c8ff', width=3)))
             fig.add_hline(y=model_proj, line_dash="dash", line_color="#ff4b4b", annotation_text="Genius Projection")
+            fig.add_hline(y=market_line, line_dash="dot", line_color="#ffeb3b", annotation_text="Vegas Line")
             fig.update_layout(title=f"{stat_label} Performance Analysis", template="plotly_dark")
             st.plotly_chart(fig, use_container_width=True)
 
         with col_right:
             st.subheader("🎯 Intelligence Gauges")
             st.write(f"**Market Hit Rate:** {hit_rate:.1f}%")
-            st.progress(hit_rate / 100)
+            st.progress(min(hit_rate / 100, 1.0))
             st.write(f"**Professional Support:** {sharp_money}% Cash")
             st.progress(sharp_money / 100)
             
