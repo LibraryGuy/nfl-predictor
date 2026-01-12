@@ -2,87 +2,74 @@ import streamlit as st
 import nflreadpy as nfl
 import pandas as pd
 import plotly.express as px
-import requests
 from nfl_stadiums import NFLStadiums
+import requests
 
-# --- 1. CONFIG ---
-st.set_page_config(page_title="NFL Sharp: Fixed", layout="wide", page_icon="🏈")
+# --- 1. SETTINGS ---
+st.set_page_config(page_title="NFL Sharp: Logic Fix", layout="wide", page_icon="🏈")
 
-# --- 2. BULLETPROOF DATA ENGINE ---
 @st.cache_data(ttl=3600)
-def load_nfl_data_stable():
+def load_base_data():
+    """Loads only the core stats to ensure the player list never breaks."""
     try:
-        # Core Stats
-        w_raw = nfl.load_player_stats(seasons=[2024, 2025]).to_pandas()
-        s_raw = nfl.load_schedules(seasons=[2024, 2025]).to_pandas()
-
-        # A. Flatten Headers immediately
-        if isinstance(w_raw.columns, pd.MultiIndex):
-            w_raw.columns = ["_".join(filter(None, map(str, col))).strip() for col in w_raw.columns.values]
-
-        # B. Map Columns (Flexible Search)
-        mapping = {
-            'player_display_name': 'player_name',
-            'player_name': 'player_name',
-            'recent_team': 'team',
-            'team': 'team',
-            'team_abbr': 'team',
-            'opponent_team': 'opponent',
-            'opponent': 'opponent'
-        }
+        df = nfl.load_player_stats(seasons=[2024, 2025]).to_pandas()
         
-        # Rename based on what exists
-        found_map = {col: mapping[col] for col in w_raw.columns if col in mapping}
-        w_raw = w_raw.rename(columns=found_map)
-
-        # C. Create Scrimmage Yards (Safe calculation)
-        w_raw['total_scrimmage_yards'] = w_raw.get('rushing_yards', 0).fillna(0) + w_raw.get('receiving_yards', 0).fillna(0)
-
-        # D. The "Safe" Weather Merge
-        # We wrap this in a try/except so if weather fails, the app still works
-        try:
-            merged = w_raw.merge(
-                s_raw[['season', 'week', 'home_team', 'temp', 'wind']], 
-                left_on=['season', 'week', 'team'], 
-                right_on=['season', 'week', 'home_team'], 
-                how='left'
-            )
-            # If merge worked, use it. If it returned empty, fall back to w_raw.
-            final_df = merged if not merged.empty else w_raw
-        except:
-            final_df = w_raw
-
-        # E. Defense Engine
-        dvp = final_df.groupby(['opponent', 'position'])['total_scrimmage_yards'].mean().reset_index()
+        # Flatten MultiIndex immediately
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = ["_".join(filter(None, map(str, col))).strip() for col in df.columns.values]
         
-        return final_df.fillna(0), dvp
+        # Robust naming: find the name column regardless of what it's called
+        name_options = ['player_display_name', 'player_name', 'player']
+        for opt in name_options:
+            if opt in df.columns:
+                df = df.rename(columns={opt: 'player_name'})
+                break
         
+        # Ensure we don't have duplicate 'player_name' columns
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+        
+        return df.fillna(0)
     except Exception as e:
-        st.error(f"Critical Sync Failure: {e}")
-        # Return empty dataframes so the rest of the app doesn't TypeError
-        return pd.DataFrame(columns=['player_name', 'team', 'position']), pd.DataFrame()
+        st.error(f"Base Load Failed: {e}")
+        return pd.DataFrame()
 
-# IMPORTANT: Always unpack both returns
-data, dvp_data = load_nfl_data_stable()
+# Load the core data
+data = load_base_data()
 
-# --- 3. UI LOGIC ---
+# --- 2. PLAYER SELECTION (THE PART THAT WAS CRASHING) ---
 if not data.empty and 'player_name' in data.columns:
-    # Safely get player names
-    player_list = sorted([p for p in data['player_name'].unique() if p and str(p) != 'nan'])
+    # We use list(set()) as a backup to .unique() for extra safety
+    raw_names = data['player_name'].dropna().unique()
+    clean_names = sorted([str(p) for p in raw_names if str(p) not in ['nan', 'None', 'Unknown']])
     
-    selected_p = st.selectbox("Select Player", player_list)
-    p_df = data[data['player_name'] == selected_p]
+    st.title("🏈 NFL Genius: Logic Pro")
+    selected_p = st.selectbox("Select Player", clean_names)
     
-    # Simple Visual to confirm it works
-    st.subheader(f"Performance for {selected_p}")
-    st.plotly_chart(px.bar(p_df, x='week', y='total_scrimmage_yards'), use_container_width=True)
+    # Filter to current player
+    p_df = data[data['player_name'] == selected_p].copy()
+    p_pos = p_df['position'].iloc[-1] if not p_df.empty else 'WR'
     
-    # Defense Dropdown
-    all_defenses = sorted(data['team'].unique())
-    target_def = st.selectbox("Project against Defense", all_defenses)
+    # --- 3. ON-DEMAND WEATHER & DEFENSE ---
+    # We only do the complex stuff once a player is chosen
+    st.sidebar.header("Matchup Context")
+    stadiums = NFLStadiums()
+    sel_stad = st.sidebar.selectbox("Venue", sorted(stadiums.get_list_of_stadium_names()))
     
-    # Display raw data for peace of mind
-    if st.checkbox("Show Raw Data Debugger"):
-        st.write(data.head())
+    # Simple calculation for projection
+    t_stat = 'passing_yards' if p_pos == 'QB' else 'receiving_yards' if p_pos in ['WR', 'TE'] else 'rushing_yards'
+    avg_val = p_df[t_stat].mean()
+    
+    # Layout
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        st.subheader(f"{selected_p} ({p_pos}) Trends")
+        st.plotly_chart(px.line(p_df, x='week', y=t_stat, markers=True), use_container_width=True)
+    
+    with col2:
+        st.metric("Season Average", f"{avg_val:.1f} Yds")
+        v_line = st.number_input("Market Line", value=float(round(avg_val)))
+        edge = ((avg_val - v_line) / v_line) * 100 if v_line > 0 else 0
+        st.metric("Model Edge", f"{edge:.1f}%")
+
 else:
-    st.error("No data found. Please check your internet connection or nflreadpy version.")
+    st.warning("Data is still syncing or the source schema has changed. Please refresh.")
