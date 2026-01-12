@@ -47,11 +47,10 @@ if not data.empty:
         selected_p = st.selectbox("Select Player", sorted(data['player_name'].unique()))
         selected_opp = st.selectbox("Opponent Defense", sorted(data['opponent'].unique()))
         
-        # --- AUTOMATED VENUE & WEATHER LOGIC ---
+        # --- AUTOMATED VENUE LOGIC ---
         sel_stad_name = st.selectbox("Game Venue", sorted(stadium_client.get_list_of_stadium_names()))
         stad_data = stadium_client.get_stadium_by_name(sel_stad_name)
         
-        # Determine Roof Type
         roof_type = stad_data.get('roof_type', 'Outdoor').lower()
         is_indoor = any(x in roof_type for x in ['dome', 'indoor', 'retractable'])
         
@@ -62,30 +61,30 @@ if not data.empty:
 
         st.divider()
         st.subheader("📊 Market Sentiment")
-        public_tickets = st.slider("% of Total Bets", 0, 100, 70)
-        sharp_money = st.slider("% of Total Cash", 0, 100, 45)
+        public_tickets = st.slider("% of Total Bets (Tickets)", 0, 100, 70)
+        sharp_money = st.slider("% of Total Cash (Handle)", 0, 100, 45)
 
         st.divider()
-        st.subheader("🎬 Game Script")
+        st.subheader("🎬 Game Script Engine")
         game_script = st.select_slider("Expected Flow", options=["Defensive Struggle", "Balanced", "Shootout"], value="Balanced")
 
-    # --- FETCH LIVE WEATHER ---
-    with st.spinner(f"Fetching forecast for {sel_stad_name}..."):
-        # Uses Open-Meteo via nfl-stadiums for a 7-day forecast
-        forecast = stadium_client.get_weather_forecast_for_stadium(sel_stad_name, datetime.now().strftime("%Y-%m-%d"))
-        
-        # Extract hourly average or current (Simplified logic for prompt)
-        # Note: If indoor, we override these to neutral
-        if is_indoor:
-            wind_speed = 0
-            precip_prob = 0
-            weather_desc = "Controlled (Indoor/Dome)"
-        else:
-            # Safely navigate forecast JSON (handles API variations)
-            hourly = forecast.get('hourly', {})
-            wind_speed = sum(hourly.get('wind_speed_10m', [0])[:12]) / 12 # Avg next 12h
-            precip_prob = max(hourly.get('precipitation_probability', [0])[:12])
-            weather_desc = "Outdoor / Open"
+    # --- 3. BULLETPROOF WEATHER ENGINE (FIXED) ---
+    with st.spinner(f"Analyzing conditions at {sel_stad_name}..."):
+        try:
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            forecast = stadium_client.get_weather_forecast_for_stadium(sel_stad_name, today_str)
+            
+            if is_indoor or not forecast:
+                wind_speed, precip_prob = 0, 0
+            else:
+                hourly = forecast.get('hourly', {})
+                wind_list = hourly.get('wind_speed_10m', [0])
+                precip_list = hourly.get('precipitation_probability', [0])
+                wind_speed = sum(wind_list[:8]) / 8 if wind_list else 5
+                precip_prob = max(precip_list[:8]) if precip_list else 0
+        except Exception:
+            # Fallback to safe defaults if API fails
+            wind_speed, precip_prob = 5, 0
 
     p_df = data[data['player_name'] == selected_p].copy()
     
@@ -95,72 +94,66 @@ if not data.empty:
                     'WR': ('receiving_yards', 'Rec Yds', 'pass_adj'), 'TE': ('receiving_yards', 'Rec Yds', 'pass_adj')}
         stat_col, stat_label, adj_key = stat_map.get(p_pos, ('receiving_yards', 'Yds', 'pass_adj'))
 
-        # Multipliers
+        # Projections Logic
         hist_avg = p_df[stat_col].mean()
         sos_multiplier = DEF_STATS_2025.get(selected_opp, {}).get(adj_key, 1.0)
         script_boost = {"Defensive Struggle": 0.90, "Balanced": 1.0, "Shootout": 1.15}[game_script]
         
-        # Weather Multiplier (Automated)
+        # Weather Adjustments
         weather_multiplier = 1.0
         if not is_indoor:
             if p_pos in ['QB', 'WR', 'TE']:
                 if wind_speed > 18: weather_multiplier *= 0.88
                 if precip_prob > 50: weather_multiplier *= 0.90
-            elif p_pos == 'RB':
-                if precip_prob > 50: weather_multiplier *= 1.05 # RBs benefit slightly from rain/snow chaos
+            elif p_pos == 'RB' and precip_prob > 50: 
+                weather_multiplier *= 1.05
 
-        # FINAL PROJECTION
         model_proj = (hist_avg * 1.10) * script_boost * sos_multiplier * weather_multiplier
         
-        # TD & Market Math
-        td_col = 'passing_tds' if p_pos == 'QB' else 'total_tds'
-        if p_pos != 'QB': p_df['total_tds'] = p_df['rushing_tds'] + p_df['receiving_tds']
-        td_prob = (len(p_df[p_df[td_col] >= (1.5 if p_pos == 'QB' else 0.5)]) / len(p_df)) * 100
-        hit_rate = (p_df[stat_col] >= market_line).mean() * 100 if market_line > 0 else 0
+        # Market Math
         implied_prob = (abs(market_odds)/(abs(market_odds)+100))*100 if market_odds < 0 else (100/(market_odds+100))*100
+        hit_rate = (p_df[stat_col] >= market_line).mean() * 100 if market_line > 0 else 0
         ev_edge = hit_rate - implied_prob
+        money_delta = sharp_money - public_tickets
 
-        # --- 3. THE DASHBOARD ---
+        # --- 4. THE DASHBOARD ---
         st.title(f"📊 {selected_p} Intelligence Hub")
         
-        # Live Weather & SOS Alert Bar
+        # Alert Triage
         a1, a2, a3 = st.columns(3)
         with a1:
-            st.info(f"🏟️ **Venue:** {roof_type.title()}")
+            st.info(f"🏟️ Venue: {roof_type.title()}")
         with a2:
-            st.warning(f"🌬️ **Live Wind:** {wind_speed:.1f} MPH")
+            st.warning(f"🌬️ Wind: {wind_speed:.1f} MPH") if wind_speed > 12 else st.write("🌬️ Calm Winds")
         with a3:
-            st.error(f"🌧️ **Precip Prob:** {precip_prob}%")
+            if money_delta > 15: st.success("💎 SHARP SIGNAL DETECTED")
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Season Average", f"{hist_avg:.1f}")
-        m2.metric("Weather Impact", f"{weather_multiplier:.2f}x", delta="DOME/CLEAN" if is_indoor else "LIVE CONDITIONS")
+        m2.metric("Total Multiplier", f"{sos_multiplier * script_boost * weather_multiplier:.2f}x")
         m3.metric("Model Projection", f"{model_proj:.1f}")
-        m4.metric("Market Edge (EV)", f"{ev_edge:+.1f}%", delta="SHARP" if (sharp_money-public_tickets)>10 else None)
+        m4.metric("Market Edge (EV)", f"{ev_edge:+.1f}%", delta="VALUE" if ev_edge > 0 else "NO VALUE")
 
         st.divider()
         col_left, col_right = st.columns([2, 1])
         with col_left:
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=p_df.index, y=p_df[stat_col], name="Actuals", line=dict(color='#00c8ff', width=3)))
-            fig.add_hline(y=model_proj, line_dash="dash", line_color="#ff4b4b", annotation_text="Auto-Weather Adj.")
-            fig.update_layout(title=f"{stat_label} Performance vs Projections", template="plotly_dark")
+            fig.add_hline(y=model_proj, line_dash="dash", line_color="#ff4b4b", annotation_text="Genius Projection")
+            fig.update_layout(title=f"{stat_label} Performance Analysis", template="plotly_dark")
             st.plotly_chart(fig, use_container_width=True)
 
         with col_right:
             st.subheader("🎯 Intelligence Gauges")
             st.write(f"**Market Hit Rate:** {hit_rate:.1f}%")
             st.progress(hit_rate / 100)
-            st.write(f"**Money Split:** {sharp_money}% Handle")
+            st.write(f"**Professional Support:** {sharp_money}% Cash")
             st.progress(sharp_money / 100)
             
             st.divider()
             st.success(f"**Genius Leg:**\n{selected_p} OVER {round(model_proj * 0.85)}+ {stat_label}")
-            if ev_edge > 5 and (sharp_money - public_tickets) > 10:
-                st.balloons()
-                st.warning("💎 **MAX CONVICTION:** Model + Weather + Sharps all align!")
 
         with st.expander("📂 Raw Matchup Data"):
-            st.dataframe(p_df[['week', 'opponent', stat_col, td_col]].tail(10), use_container_width=True)
+            st.dataframe(p_df[['week', 'opponent', stat_col]].tail(10), use_container_width=True)
 else:
-    st.error("Data Load Error: Please check connectivity.")
+    st.error("Critical Failure: Data connection lost.")
