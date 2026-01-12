@@ -21,13 +21,18 @@ def load_data_pro():
         sched = nfl.load_schedules(seasons=[2025]).to_pandas()
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = ["_".join(filter(None, map(str, col))).strip() for col in df.columns.values]
+        
         rename_map = {'player_display_name': 'player_name', 'recent_team': 'team', 'opponent_team': 'opponent'}
         df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
         df = df.loc[:, ~df.columns.duplicated()].copy()
-        stat_cols = ['passing_yards', 'rushing_yards', 'receiving_yards', 'receptions']
+        
+        # RESTORED: Added TDs back into the tracking pipeline
+        stat_cols = ['passing_yards', 'rushing_yards', 'receiving_yards', 'receptions', 
+                     'passing_tds', 'rushing_tds', 'receiving_tds']
         for col in stat_cols:
             if col not in df.columns: df[col] = 0
             df[col] = df[col].fillna(0)
+            
         return df.dropna(subset=['player_name', 'opponent', 'position']), sched
     except Exception as e:
         st.error(f"Sync Failure: {e}"); return pd.DataFrame(), pd.DataFrame()
@@ -62,11 +67,19 @@ if not data.empty:
     p_df = data[data['player_name'] == selected_p].copy()
     if not p_df.empty:
         p_pos = p_df['position'].iloc[-1]
-        stat_map = {'QB': ('passing_yards', 'Pass Yds', 'pass_adj'), 'RB': ('rushing_yards', 'Rush Yds', 'rush_adj'), 
-                    'WR': ('receiving_yards', 'Rec Yds', 'pass_adj'), 'TE': ('receiving_yards', 'Rec Yds', 'pass_adj')}
-        stat_col, stat_label, adj_key = stat_map.get(p_pos, ('receiving_yards', 'Yds', 'pass_adj'))
+        # Map yards and their respective TD columns
+        stat_map = {
+            'QB': ('passing_yards', 'passing_tds', 'Pass Yds'), 
+            'RB': ('rushing_yards', 'rushing_tds', 'Rush Yds'), 
+            'WR': ('receiving_yards', 'receiving_tds', 'Rec Yds'), 
+            'TE': ('receiving_yards', 'receiving_tds', 'Rec Yds')
+        }
+        stat_col, td_col, stat_label = stat_map.get(p_pos, ('receiving_yards', 'receiving_tds', 'Yds'))
+        adj_key = 'pass_adj' if p_pos != 'RB' else 'rush_adj'
 
         hist_avg = p_df[stat_col].mean()
+        td_avg = p_df[td_col].mean()
+        
         sos_multiplier = DEF_STATS_2025.get(selected_opp, {}).get(adj_key, 1.0)
         script_boost = {"Defensive Struggle": 0.90, "Balanced": 1.0, "Shootout": 1.15}[game_script]
         model_proj = (hist_avg * 1.10) * script_boost * sos_multiplier
@@ -76,7 +89,6 @@ if not data.empty:
         
         col_main, col_side = st.columns([2, 1])
         with col_main:
-            # --- NEW: PREVIOUS 5 GAME HIT RATE CHART ---
             last_5 = p_df.tail(5).copy()
             last_5['hit'] = last_5[stat_col] >= safe_leg_val
             colors = ['#00ff96' if hit else '#4a4a4a' for hit in last_5['hit']]
@@ -89,15 +101,29 @@ if not data.empty:
             fig_hits.update_layout(title=f"Last 5: Performance vs Genius Leg ({safe_leg_val}+)", template="plotly_dark", height=300)
             st.plotly_chart(fig_hits, use_container_width=True)
 
-            # Performance Trend
             fig_trend = go.Figure()
             fig_trend.add_trace(go.Scatter(y=p_df[stat_col], name="History", line=dict(color='#00c8ff')))
             fig_trend.update_layout(title="Full Season Trend", template="plotly_dark", height=300)
             st.plotly_chart(fig_trend, use_container_width=True)
 
         with col_side:
+            # --- NEW: AVERAGES COMPARISON TABLE ---
+            st.subheader("📋 Historical Averages")
+            avg_data = {
+                "Metric": [stat_label, "Touchdowns"],
+                "Season": [round(hist_avg, 1), round(td_avg, 2)],
+                "Last 5": [round(last_5[stat_col].mean(), 1), round(last_5[td_col].mean(), 2)]
+            }
+            st.table(pd.DataFrame(avg_data))
+            
+            st.divider()
             st.subheader("🔥 Parlay Recommendations")
             st.success(f"**Safe Leg:** {selected_p} {safe_leg_val}+ {stat_label}")
+            
+            # Contextual TD Recommendation
+            if last_5[td_col].mean() >= 0.6:
+                st.info(f"**High Value TD:** {selected_p} Anytime TD Scorer")
+
             if game_script == "Shootout": st.warning(f"**Correlated Leg:** Over {v_total - 1.5} Total Pts")
             elif v_spread < -6: st.warning(f"**Correlated Leg:** {p_team} Moneyline")
             
@@ -105,5 +131,3 @@ if not data.empty:
             hit_count = last_5['hit'].sum()
             st.write(f"**Recent Consistency:** {hit_count}/5 Games Hit")
             st.progress(hit_count / 5)
-            
-            if sharp_money > 60: st.error("⚠️ SHARP WHALE ALERT")
