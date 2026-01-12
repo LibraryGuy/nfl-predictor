@@ -1,9 +1,9 @@
 import streamlit as st
 import nflreadpy as nfl
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 from nfl_stadiums import NFLStadiums
+from datetime import datetime
 
 # --- 1. SETTINGS & DATA ---
 st.set_page_config(page_title="NFL Sharp: Intelligence Hub", layout="wide", page_icon="🏈")
@@ -46,7 +46,14 @@ if not data.empty:
         st.header("🎯 Target Selection")
         selected_p = st.selectbox("Select Player", sorted(data['player_name'].unique()))
         selected_opp = st.selectbox("Opponent Defense", sorted(data['opponent'].unique()))
-        sel_stad = st.selectbox("Game Venue", sorted(stadium_client.get_list_of_stadium_names()))
+        
+        # --- AUTOMATED VENUE & WEATHER LOGIC ---
+        sel_stad_name = st.selectbox("Game Venue", sorted(stadium_client.get_list_of_stadium_names()))
+        stad_data = stadium_client.get_stadium_by_name(sel_stad_name)
+        
+        # Determine Roof Type
+        roof_type = stad_data.get('roof_type', 'Outdoor').lower()
+        is_indoor = any(x in roof_type for x in ['dome', 'indoor', 'retractable'])
         
         st.divider()
         st.subheader("💰 Market Details")
@@ -54,102 +61,106 @@ if not data.empty:
         market_odds = st.number_input("American Odds (e.g. -110)", value=-110, step=5)
 
         st.divider()
-        st.subheader("📊 Market Sentiment (Tickets vs Money)")
-        public_tickets = st.slider("% of Total Bets (Tickets)", 0, 100, 70)
-        sharp_money = st.slider("% of Total Cash (Handle)", 0, 100, 45)
+        st.subheader("📊 Market Sentiment")
+        public_tickets = st.slider("% of Total Bets", 0, 100, 70)
+        sharp_money = st.slider("% of Total Cash", 0, 100, 45)
 
         st.divider()
-        st.subheader("🎬 Game Script & Weather")
-        game_script = st.select_slider("Expected Game Flow", options=["Defensive Struggle", "Balanced", "Shootout"], value="Balanced")
-        precip = st.selectbox("Precipitation", ["None", "Rain", "Heavy Snow"])
-        wind_speed = st.slider("Wind Speed (MPH)", 0, 40, 5)
+        st.subheader("🎬 Game Script")
+        game_script = st.select_slider("Expected Flow", options=["Defensive Struggle", "Balanced", "Shootout"], value="Balanced")
+
+    # --- FETCH LIVE WEATHER ---
+    with st.spinner(f"Fetching forecast for {sel_stad_name}..."):
+        # Uses Open-Meteo via nfl-stadiums for a 7-day forecast
+        forecast = stadium_client.get_weather_forecast_for_stadium(sel_stad_name, datetime.now().strftime("%Y-%m-%d"))
+        
+        # Extract hourly average or current (Simplified logic for prompt)
+        # Note: If indoor, we override these to neutral
+        if is_indoor:
+            wind_speed = 0
+            precip_prob = 0
+            weather_desc = "Controlled (Indoor/Dome)"
+        else:
+            # Safely navigate forecast JSON (handles API variations)
+            hourly = forecast.get('hourly', {})
+            wind_speed = sum(hourly.get('wind_speed_10m', [0])[:12]) / 12 # Avg next 12h
+            precip_prob = max(hourly.get('precipitation_probability', [0])[:12])
+            weather_desc = "Outdoor / Open"
 
     p_df = data[data['player_name'] == selected_p].copy()
     
     if not p_df.empty:
         p_pos = p_df['position'].iloc[-1]
-        stat_map = {
-            'QB': ('passing_yards', 'Pass Yds', 'pass_adj'),
-            'RB': ('rushing_yards', 'Rush Yds', 'rush_adj'),
-            'WR': ('receiving_yards', 'Rec Yds', 'pass_adj'),
-            'TE': ('receiving_yards', 'Rec Yds', 'pass_adj')
-        }
+        stat_map = {'QB': ('passing_yards', 'Pass Yds', 'pass_adj'), 'RB': ('rushing_yards', 'Rush Yds', 'rush_adj'), 
+                    'WR': ('receiving_yards', 'Rec Yds', 'pass_adj'), 'TE': ('receiving_yards', 'Rec Yds', 'pass_adj')}
         stat_col, stat_label, adj_key = stat_map.get(p_pos, ('receiving_yards', 'Yds', 'pass_adj'))
 
-        # Calculations
+        # Multipliers
         hist_avg = p_df[stat_col].mean()
         sos_multiplier = DEF_STATS_2025.get(selected_opp, {}).get(adj_key, 1.0)
         script_boost = {"Defensive Struggle": 0.90, "Balanced": 1.0, "Shootout": 1.15}[game_script]
         
-        # Weather Logic
+        # Weather Multiplier (Automated)
         weather_multiplier = 1.0
-        if p_pos in ['QB', 'WR', 'TE']:
-            if wind_speed > 20: weather_multiplier *= 0.85 
-            elif wind_speed > 15: weather_multiplier *= 0.93
-            if precip == "Rain": weather_multiplier *= 0.88 
-            elif precip == "Heavy Snow": weather_multiplier *= 0.75 
-        else: # RB
-            if precip == "Heavy Snow": weather_multiplier *= 1.10
-            if wind_speed > 20: weather_multiplier *= 1.05
+        if not is_indoor:
+            if p_pos in ['QB', 'WR', 'TE']:
+                if wind_speed > 18: weather_multiplier *= 0.88
+                if precip_prob > 50: weather_multiplier *= 0.90
+            elif p_pos == 'RB':
+                if precip_prob > 50: weather_multiplier *= 1.05 # RBs benefit slightly from rain/snow chaos
 
         # FINAL PROJECTION
         model_proj = (hist_avg * 1.10) * script_boost * sos_multiplier * weather_multiplier
         
-        # Market Math
-        implied_prob = (abs(market_odds)/(abs(market_odds)+100))*100 if market_odds < 0 else (100/(market_odds+100))*100
+        # TD & Market Math
+        td_col = 'passing_tds' if p_pos == 'QB' else 'total_tds'
+        if p_pos != 'QB': p_df['total_tds'] = p_df['rushing_tds'] + p_df['receiving_tds']
+        td_prob = (len(p_df[p_df[td_col] >= (1.5 if p_pos == 'QB' else 0.5)]) / len(p_df)) * 100
         hit_rate = (p_df[stat_col] >= market_line).mean() * 100 if market_line > 0 else 0
+        implied_prob = (abs(market_odds)/(abs(market_odds)+100))*100 if market_odds < 0 else (100/(market_odds+100))*100
         ev_edge = hit_rate - implied_prob
-
-        # --- SHARP INDICATOR LOGIC ---
-        money_delta = sharp_money - public_tickets
-        is_sharp = money_delta > 10  # Money % significantly higher than ticket %
-        is_public = public_tickets > 75 # "Public Hero" status
 
         # --- 3. THE DASHBOARD ---
         st.title(f"📊 {selected_p} Intelligence Hub")
         
-        # Multi-Alert Banner
-        cols = st.columns(3)
-        with cols[0]:
-            if sos_multiplier < 1.0: st.error(f"📉 SOS: {selected_opp} -{abs(sos_multiplier-1)*100:.0f}%")
-        with cols[1]:
-            if weather_multiplier != 1.0: st.warning(f"🌧️ Weather: {abs(weather_multiplier-1)*100:.0f}% Impact")
-        with cols[2]:
-            if is_sharp: st.success("💎 SHARP SIGNAL: Big money backing this side.")
-            elif is_public: st.info("📢 PUBLIC FAVORITE: Casuals are heavy on this.")
+        # Live Weather & SOS Alert Bar
+        a1, a2, a3 = st.columns(3)
+        with a1:
+            st.info(f"🏟️ **Venue:** {roof_type.title()}")
+        with a2:
+            st.warning(f"🌬️ **Live Wind:** {wind_speed:.1f} MPH")
+        with a3:
+            st.error(f"🌧️ **Precip Prob:** {precip_prob}%")
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Season Average", f"{hist_avg:.1f}")
-        m2.metric("Money vs Tickets", f"{sharp_money}% / {public_tickets}%", delta=f"{money_delta:+.1f}% Spread")
+        m2.metric("Weather Impact", f"{weather_multiplier:.2f}x", delta="DOME/CLEAN" if is_indoor else "LIVE CONDITIONS")
         m3.metric("Model Projection", f"{model_proj:.1f}")
-        m4.metric("Market Edge (EV)", f"{ev_edge:+.1f}%", delta="POS VALUE" if ev_edge > 0 else "BAD VALUE", delta_color="normal" if ev_edge > 0 else "inverse")
+        m4.metric("Market Edge (EV)", f"{ev_edge:+.1f}%", delta="SHARP" if (sharp_money-public_tickets)>10 else None)
 
         st.divider()
         col_left, col_right = st.columns([2, 1])
         with col_left:
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=p_df.index, y=p_df[stat_col], name="Actuals", line=dict(color='#00c8ff', width=3)))
-            fig.add_hline(y=model_proj, line_dash="dash", line_color="#ff4b4b", annotation_text="Final Adj. Projection")
-            if market_line > 0: fig.add_hline(y=market_line, line_dash="dot", line_color="yellow", annotation_text="Market Line")
-            fig.update_layout(title=f"{stat_label} Performance Analysis", template="plotly_dark")
+            fig.add_hline(y=model_proj, line_dash="dash", line_color="#ff4b4b", annotation_text="Auto-Weather Adj.")
+            fig.update_layout(title=f"{stat_label} Performance vs Projections", template="plotly_dark")
             st.plotly_chart(fig, use_container_width=True)
 
         with col_right:
             st.subheader("🎯 Intelligence Gauges")
-            st.write(f"**Historical Hit Rate:** {hit_rate:.1f}%")
+            st.write(f"**Market Hit Rate:** {hit_rate:.1f}%")
             st.progress(hit_rate / 100)
-            
-            # Sentiment Gauge
-            st.write(f"**Sharpness Index:** {sharp_money}% Cash")
+            st.write(f"**Money Split:** {sharp_money}% Handle")
             st.progress(sharp_money / 100)
-            st.caption("Professionals (Sharp) usually represent a higher % of money than tickets.")
             
             st.divider()
             st.success(f"**Genius Leg:**\n{selected_p} OVER {round(model_proj * 0.85)}+ {stat_label}")
-            if is_sharp and ev_edge > 0:
-                st.warning("🔥 **SHARP/MODEL ALIGNMENT:** Model and Pro Money both love this.")
+            if ev_edge > 5 and (sharp_money - public_tickets) > 10:
+                st.balloons()
+                st.warning("💎 **MAX CONVICTION:** Model + Weather + Sharps all align!")
 
-        with st.expander("📂 Raw Matchup Data & Splits"):
-            st.dataframe(p_df[['week', 'opponent', stat_col, 'passing_tds' if p_pos=='QB' else 'rushing_tds']].tail(10), use_container_width=True)
+        with st.expander("📂 Raw Matchup Data"):
+            st.dataframe(p_df[['week', 'opponent', stat_col, td_col]].tail(10), use_container_width=True)
 else:
     st.error("Data Load Error: Please check connectivity.")
