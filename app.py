@@ -3,7 +3,6 @@ import nflreadpy as nfl
 import pandas as pd
 import plotly.graph_objects as go
 from nfl_stadiums import NFLStadiums
-from datetime import datetime
 
 # --- 1. SETTINGS & DATA ---
 st.set_page_config(page_title="NFL Sharp: Intelligence Hub", layout="wide", page_icon="🏈")
@@ -55,11 +54,14 @@ if not data.empty:
         st.info(f"🤖 **Vegas Pulse:** {v_total} O/U | Spread: {v_spread}")
         sel_stad_name = st.selectbox("Game Venue", sorted(stadium_client.get_list_of_stadium_names()))
         market_line = st.number_input("Sportsbook Line", value=0.0, step=0.5)
-        market_odds = st.number_input("American Odds", value=-110, step=5)
-        sharp_money = st.slider("% Sharp Handle", 0, 100, 45)
+        
+        # --- NEW: MONEY TRACKER INPUTS ---
+        st.divider()
+        st.write("**💰 Market Sentiment**")
+        ticket_pct = st.slider("% Public Tickets (Volume)", 0, 100, 65)
+        handle_pct = st.slider("% Sharp Handle (Dollars)", 0, 100, 45)
+        
         game_script = st.select_slider("Expected Flow", options=["Defensive Struggle", "Balanced", "Shootout"], value=auto_script_val)
-
-        # TRIGGER POPUP: This shows a notification when the script is active
         st.toast(f"Active Script: {game_script}", icon="🎭")
 
     p_df = data[data['player_name'] == selected_p].copy()
@@ -72,49 +74,60 @@ if not data.empty:
 
         hist_avg = p_df[stat_col].mean()
         td_avg = p_df[td_col].mean()
-        
         sos_multiplier = DEF_STATS_2025.get(selected_opp, {}).get(adj_key, 1.0)
         script_boost = {"Defensive Struggle": 0.90, "Balanced": 1.0, "Shootout": 1.15}[game_script]
         
-        # FINAL PROJECTION CALCULATION
         model_proj = (hist_avg * 1.10) * script_boost * sos_multiplier
         safe_leg_val = round(model_proj * 0.85)
 
-        # Logic Verification Table (Sidebar)
-        with st.sidebar:
-            st.divider()
-            st.write("**⚙️ Flow Math Verification**")
-            st.caption(f"Multiplier: {script_boost}x for {game_script}")
-            st.caption(f"Unadjusted Proj: {round(hist_avg * 1.10, 1)}")
-            st.caption(f"Final Model Proj: {round(model_proj, 1)}")
-
         st.title(f"📊 {selected_p} Intelligence Hub")
         col_main, col_side = st.columns([2, 1])
+        
         with col_main:
+            # --- NEW: SPORTSBOOK MONEY TRACKER CHART ---
+            st.subheader("🏦 Sportsbook Money Tracker")
+            fig_money = go.Figure()
+            fig_money.add_trace(go.Bar(name='Tickets (Public)', x=['Over/Under'], y=[ticket_pct], marker_color='#4a4a4a'))
+            fig_money.add_trace(go.Bar(name='Handle (Sharps)', x=['Over/Under'], y=[handle_pct], marker_color='#00ff96'))
+            
+            # Highlight Sharp Action
+            if handle_pct > ticket_pct + 10:
+                money_msg = "🔥 Significant Sharp Money Detected"
+            elif ticket_pct > handle_pct + 15:
+                money_msg = "⚠️ Public Heavy - Possible Trap"
+            else:
+                money_msg = "⚖️ Balanced Market Action"
+                
+            fig_money.update_layout(barmode='group', template="plotly_dark", height=250, margin=dict(t=20, b=20),
+                                  title=dict(text=money_msg, font=dict(size=14, color="#00ff96")))
+            st.plotly_chart(fig_money, use_container_width=True)
+
+            # Previous Charts
             last_5 = p_df.tail(5).copy()
             last_5['hit'] = last_5[stat_col] >= safe_leg_val
-            colors = ['#00ff96' if hit else '#4a4a4a' for hit in last_5['hit']]
-            fig_hits = go.Figure(go.Bar(x=[f"Wk {w}" for w in last_5['week']], y=last_5[stat_col], marker_color=colors, text=last_5[stat_col], textposition='auto'))
-            fig_hits.add_hline(y=safe_leg_val, line_dash="dash", line_color="#ff4b4b", annotation_text=f"Target: {safe_leg_val}")
-            fig_hits.update_layout(title=f"Last 5 vs Genius Leg ({safe_leg_val}+) | Mode: {game_script}", template="plotly_dark", height=300)
+            fig_hits = go.Figure(go.Bar(x=[f"Wk {w}" for w in last_5['week']], y=last_5[stat_col], 
+                                       marker_color=['#00ff96' if hit else '#4a4a4a' for hit in last_5['hit']], text=last_5[stat_col], textposition='auto'))
+            fig_hits.add_hline(y=safe_leg_val, line_dash="dash", line_color="#ff4b4b")
+            fig_hits.update_layout(title=f"Performance vs Target ({safe_leg_val}+)", template="plotly_dark", height=250)
             st.plotly_chart(fig_hits, use_container_width=True)
-            
-            fig_trend = go.Figure()
-            fig_trend.add_trace(go.Scatter(y=p_df[stat_col], name="History", line=dict(color='#00c8ff')))
-            fig_trend.update_layout(title="Full Season Trend", template="plotly_dark", height=300)
-            st.plotly_chart(fig_trend, use_container_width=True)
 
         with col_side:
             st.subheader("📋 Historical Averages")
             avg_data = {"Metric": [stat_label, "Touchdowns"], "Season": [round(hist_avg, 1), round(td_avg, 2)], "Last 5": [round(last_5[stat_col].mean(), 1), round(last_5[td_col].mean(), 2)]}
             st.table(pd.DataFrame(avg_data))
+            
             st.divider()
             st.subheader("🔥 Parlay Recommendations")
-            st.success(f"**Safe Leg:** {selected_p} {safe_leg_val}+ {stat_label}")
+            # Logic check for Sharp Money in recommendations
+            if handle_pct > ticket_pct + 5:
+                st.success(f"💎 **Sharp Pick:** {selected_p} {safe_leg_val}+ {stat_label}")
+            else:
+                st.success(f"**Safe Leg:** {selected_p} {safe_leg_val}+ {stat_label}")
+            
             if last_5[td_col].mean() >= 0.6: st.info(f"**High Value TD:** {selected_p} Anytime TD Scorer")
             if game_script == "Shootout": st.warning(f"**Correlated Leg:** Over {v_total - 1.5} Total Pts")
-            elif v_spread < -6: st.warning(f"**Correlated Leg:** {p_team} Moneyline")
+            
             st.divider()
             hit_count = last_5['hit'].sum()
-            st.write(f"**Recent Consistency:** {hit_count}/5 Games Hit")
+            st.write(f"**Consistency:** {hit_count}/5 Games Hit")
             st.progress(hit_count / 5)
