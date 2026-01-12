@@ -15,17 +15,16 @@ if "parlay_legs" not in st.session_state:
 @st.cache_data(ttl=3600)
 def load_and_fix_data():
     try:
-        # Load 2025/2026 Stats
+        # Load 2025/2026 stats
         raw = nfl.load_player_stats(seasons=[2024, 2025]).to_pandas()
         
-        # A. FLATTEN MULTI-INDEX HEADERS
-        # This is the likely cause of your AttributeError. 
-        # It turns ('offense', 'player_name') into just 'player_name'.
+        # A. THE CRITICAL FIX: FLATTEN HEADERS
+        # This converts MultiIndex tuples into plain strings so the UI can find them
         if isinstance(raw.columns, pd.MultiIndex):
             raw.columns = [col[1] if col[1] else col[0] for col in raw.columns.values]
         
         # B. 2026 SCHEMA MAPPING
-        # Mapping variants to a standard set of names your UI expects
+        # Mapping variants to standard names for UI stability
         rename_map = {
             'player_display_name': 'player_name',
             'recent_team': 'team',
@@ -36,7 +35,6 @@ def load_and_fix_data():
         raw = raw.rename(columns={k: v for k, v in rename_map.items() if k in raw.columns})
 
         # C. DEFENSE ANALYTICS ENGINE
-        # Grouping by opponent and position to find "leaky" defenses
         def_stats = raw.groupby(['opponent', 'position']).agg({
             'passing_yards': 'mean',
             'rushing_yards': 'mean',
@@ -45,7 +43,7 @@ def load_and_fix_data():
         
         return raw.fillna(0), def_stats
     except Exception as e:
-        # If this fails, return empty DataFrames so the rest of the app doesn't crash
+        # Prevents app crash if data is missing or connection fails
         return pd.DataFrame(columns=['player_name', 'opponent', 'position']), pd.DataFrame()
 
 # Execute loading
@@ -53,14 +51,13 @@ data, def_data = load_and_fix_data()
 
 # --- 3. ANALYTICS ---
 def get_td_prob(avg_td, match_mod):
-    # Poisson probability: P(at least 1 TD) = 1 - e^(-lambda)
     lam = avg_td * match_mod
     return (1 - exp(-lam)) * 100
 
 # --- 4. THE INTERFACE ---
-st.title("🏈 NFL Genius: Pro Build")
+st.title("🏈 NFL Genius: Pro Suite")
 
-# SIDEBAR: Placed early so it renders even if data is still loading
+# Sidebar rendering at top level so it doesn't disappear on error
 with st.sidebar:
     st.header("📋 Parlay Builder")
     if st.session_state.parlay_legs:
@@ -72,36 +69,32 @@ with st.sidebar:
     else:
         st.info("No legs added yet.")
 
-# Main Page Logic
+# Main Page UI Logic
 if not data.empty and 'player_name' in data.columns:
     col1, col2 = st.columns([2, 1])
 
     with col1:
-        # Player Selection (Bracket notation is safer than dot notation)
+        # Bracket notation [] is safer than dot notation .
         players = sorted(data['player_name'].unique())
         p_name = st.selectbox("Select Target Player", players)
         p_sub = data[data['player_name'] == p_name]
         p_pos = p_sub['position'].iloc[-1]
         
-        # Defense Selection
         opp_list = sorted(data['opponent'].unique())
         target_def = st.selectbox("Vs. Defense", opp_list)
         
-        # Calculate Defense Modifier
+        # Defense Matchup Modifier
         d_sub = def_data[(def_data['def_team'] == target_def) & (def_data['position'] == p_pos)]
-        # If defense allows >55 yards avg to this pos, apply a 15% "boost"
         mod = 1.15 if (not d_sub.empty and d_sub['receiving_yards'].iloc[0] > 55) else 0.90
 
     with col2:
         st.subheader("📊 Sharp Metrics")
         v_line = st.number_input("Vegas Line", value=50.5)
         
-        # Yardage Proj
         avg_yds = p_sub['receiving_yards'].mean() if p_pos in ['WR', 'TE'] else p_sub['rushing_yards'].mean()
         proj_yds = avg_yds * mod
         edge = ((proj_yds - v_line) / v_line) * 100
         
-        # TD Proj
         avg_td = (p_sub['rush_td'].mean() + p_sub['rec_td'].mean())
         td_prob = get_td_prob(avg_td, mod)
         
@@ -115,10 +108,9 @@ if not data.empty and 'player_name' in data.columns:
             "pick": f"{'Over' if edge > 0 else 'Under'} {v_line} Yds",
             "edge": round(edge, 1)
         })
-        st.toast(f"Locked in {p_name}!")
+        st.toast(f"Added {p_name} to your build!")
 
-    # Performance Visual
     st.plotly_chart(px.line(p_sub, x='week', y=['rushing_yards', 'receiving_yards'], 
-                            title=f"Trend: {p_name}", markers=True), use_container_width=True)
+                            title=f"Season Momentum: {p_name}", markers=True), use_container_width=True)
 else:
-    st.warning("🔄 Data Sync in progress... Please refresh in a moment.")
+    st.warning("🔄 Data Syncing... If this persists, verify your 'nflreadpy' installation.")
