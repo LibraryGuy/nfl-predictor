@@ -5,11 +5,10 @@ import plotly.express as px
 from math import exp
 
 # --- 1. CONFIG ---
-st.set_page_config(page_title="NFL Genius Debugger", layout="wide")
+st.set_page_config(page_title="NFL Genius Fix", layout="wide")
 
 st.title("🏈 NFL Genius: Pro Builder")
 
-# Sidebar for Parlay
 if "parlay_legs" not in st.session_state:
     st.session_state.parlay_legs = []
 
@@ -21,74 +20,62 @@ with st.sidebar:
         st.session_state.parlay_legs = []
         st.rerun()
 
-# --- 2. INPUT & SEARCH ---
-col_search, col_debug = st.columns([2, 1])
-with col_search:
-    p_input = st.text_input("Player Name (Try 'Jefferson' or 'Mahomes')", "Jefferson")
-with col_debug:
-    show_debug = st.checkbox("🐞 Peek at Raw Data")
+# --- 2. INPUT ---
+p_input = st.text_input("Enter Player Name (e.g., Jefferson)", "Jefferson")
 
-# --- 3. DATA ENGINE ---
+# --- 3. THE UPDATED DATA ENGINE ---
 @st.cache_data(ttl=3600)
-def load_nfl_data():
+def load_and_standardize_data():
     try:
-        # Loading 2024 and 2025
+        # Load the stats (Returns a Polars df, converted to Pandas)
         df = nfl.load_player_stats(seasons=[2024, 2025]).to_pandas()
         
-        # FIX 1: Flatten MultiIndex (The AttributeError culprit)
+        # A. FLATTEN HEADERS (Prevents AttributeError)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [col[1] if col[1] else col[0] for col in df.columns.values]
         
-        # FIX 2: Standardize Name Columns
-        # nflreadpy often uses 'player_display_name'
-        if 'player_display_name' in df.columns and 'player_name' not in df.columns:
-            df['player_name'] = df['player_display_name']
-            
+        # B. THE KEYERROR FIX: TRANSLATION LAYER
+        # We map the raw nflverse names to the names your UI uses
+        rename_map = {
+            'player_display_name': 'player_name',
+            'opponent_team': 'opponent',   # This fixes your KeyError!
+            'recent_team': 'team',
+            'rushing_tds': 'rush_td',
+            'receiving_tds': 'rec_td'
+        }
+        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+        
         return df.fillna(0)
     except Exception as e:
-        st.error(f"Error loading data: {e}")
+        st.error(f"Sync Failure: {e}")
         return pd.DataFrame()
 
-data = load_nfl_data()
+data = load_and_standardize_data()
 
-# --- 4. DEBUGGER & FILTER ---
-if show_debug and not data.empty:
-    st.write("### Data Preview (First 5 Rows)")
-    st.dataframe(data.head())
-    st.write("### Available Columns:")
-    st.write(list(data.columns))
-
+# --- 4. UI LOGIC ---
 if not data.empty and p_input:
-    # We use a case-insensitive 'contains' search to find "Justin Jefferson" even if you type "Jefferson"
-    results = data[data['player_name'].str.contains(p_input, case=False, na=False)]
+    # Fuzzy search for the player
+    matches = data[data['player_name'].str.contains(p_input, case=False, na=False)]
     
-    if not results.empty:
-        # If multiple players match (e.g., 'Jones'), let user pick one
-        unique_matches = results['player_name'].unique()
-        selected_p = st.selectbox("Confirm Player", unique_matches)
-        
-        # Filter down to the specific player
+    if not matches.empty:
+        selected_p = st.selectbox("Confirm Player", matches['player_name'].unique())
         p_df = data[data['player_name'] == selected_p]
-        p_pos = p_df['position'].iloc[-1]
         
-        # --- UI LAYOUT ---
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            st.subheader(f"Analytics for {selected_p}")
-            opp = st.selectbox("Opponent Defense", sorted(data['opponent'].unique()))
-            line = st.number_input("Market Line (Yards)", value=70.5)
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            # This line now works because 'opponent' exists thanks to the rename!
+            opp_list = sorted(data['opponent'].unique()) 
+            target_opp = st.selectbox("Select Opponent", opp_list)
             
-            # Simple Math: Project Yards based on Average
-            avg_yds = p_df['receiving_yards'].mean() if p_pos in ['WR', 'TE'] else p_df['rushing_yards'].mean()
-            st.metric("Season Average", f"{avg_yds:.1f} Yds")
+            # Stats Display
+            avg_yds = p_df['receiving_yards'].mean()
+            st.metric(f"{selected_p} Avg Yards", f"{avg_yds:.1f}")
             
             if st.button("Add to Parlay"):
-                st.session_state.parlay_legs.append({"player": selected_p, "pick": f"Over {line}"})
+                st.session_state.parlay_legs.append({"player": selected_p, "pick": "Over Model"})
                 st.rerun()
-
-        with c2:
-            fig = px.bar(p_df, x='week', y='receiving_yards' if p_pos in ['WR', 'TE'] else 'rushing_yards', 
-                         title=f"Weekly Production")
-            st.plotly_chart(fig)
+        
+        with col2:
+            st.plotly_chart(px.line(p_df, x='week', y='receiving_yards', title="Weekly Trend"))
     else:
-        st.error(f"Could not find '{p_input}' in the dataset. Try a shorter name (e.g., just 'Jefferson').")
+        st.info("Searching for player data...")
