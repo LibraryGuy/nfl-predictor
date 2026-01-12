@@ -2,74 +2,99 @@ import streamlit as st
 import nflreadpy as nfl
 import pandas as pd
 import plotly.express as px
-from nfl_stadiums import NFLStadiums
-import requests
 
-# --- 1. SETTINGS ---
-st.set_page_config(page_title="NFL Sharp: Logic Fix", layout="wide", page_icon="🏈")
+# --- 1. SETTINGS & STYLING ---
+st.set_page_config(page_title="NFL Genius: Matchup Pro", layout="wide", page_icon="🏈")
 
 @st.cache_data(ttl=3600)
-def load_base_data():
-    """Loads only the core stats to ensure the player list never breaks."""
+def load_comprehensive_data():
     try:
+        # Load core player stats
         df = nfl.load_player_stats(seasons=[2024, 2025]).to_pandas()
         
-        # Flatten MultiIndex immediately
+        # Standardize Columns
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = ["_".join(filter(None, map(str, col))).strip() for col in df.columns.values]
         
-        # Robust naming: find the name column regardless of what it's called
-        name_options = ['player_display_name', 'player_name', 'player']
-        for opt in name_options:
-            if opt in df.columns:
-                df = df.rename(columns={opt: 'player_name'})
-                break
-        
-        # Ensure we don't have duplicate 'player_name' columns
+        # Map essential columns
+        rename_map = {
+            'player_display_name': 'player_name',
+            'recent_team': 'team',
+            'opponent_team': 'opponent'
+        }
+        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
         df = df.loc[:, ~df.columns.duplicated()].copy()
+        
+        # Calculate Base Scrimmage Yards
+        df['total_yds'] = df.get('rushing_yards', 0).fillna(0) + df.get('receiving_yards', 0).fillna(0)
         
         return df.fillna(0)
     except Exception as e:
-        st.error(f"Base Load Failed: {e}")
+        st.error(f"Sync Error: {e}")
         return pd.DataFrame()
 
-# Load the core data
-data = load_base_data()
+data = load_comprehensive_data()
 
-# --- 2. PLAYER SELECTION (THE PART THAT WAS CRASHING) ---
-if not data.empty and 'player_name' in data.columns:
-    # We use list(set()) as a backup to .unique() for extra safety
-    raw_names = data['player_name'].dropna().unique()
-    clean_names = sorted([str(p) for p in raw_names if str(p) not in ['nan', 'None', 'Unknown']])
+# --- 2. DEFENSE ANALYTICS ENGINE ---
+def get_defense_metrics(df):
+    """Calculates how many yards each defense allows by position."""
+    # League averages for benchmarking
+    league_avg = df.groupby('position')['total_yds'].mean().to_dict()
     
-    st.title("🏈 NFL Genius: Logic Pro")
-    selected_p = st.selectbox("Select Player", clean_names)
+    # Team-specific averages
+    def_stats = df.groupby(['opponent', 'position'])['total_yds'].mean().reset_index()
+    return def_stats, league_avg
+
+if not data.empty:
+    def_data, league_benchmarks = get_defense_metrics(data)
     
-    # Filter to current player
-    p_df = data[data['player_name'] == selected_p].copy()
-    p_pos = p_df['position'].iloc[-1] if not p_df.empty else 'WR'
+    # --- 3. UI: PLAYER & OPPONENT SELECTION ---
+    st.title("🏈 NFL Genius: Matchup Predictor")
     
-    # --- 3. ON-DEMAND WEATHER & DEFENSE ---
-    # We only do the complex stuff once a player is chosen
-    st.sidebar.header("Matchup Context")
-    stadiums = NFLStadiums()
-    sel_stad = st.sidebar.selectbox("Venue", sorted(stadiums.get_list_of_stadium_names()))
+    col_a, col_b = st.columns(2)
+    with col_a:
+        players = sorted(data['player_name'].unique())
+        selected_p = st.selectbox("1. Choose Player", players)
     
-    # Simple calculation for projection
-    t_stat = 'passing_yards' if p_pos == 'QB' else 'receiving_yards' if p_pos in ['WR', 'TE'] else 'rushing_yards'
-    avg_val = p_df[t_stat].mean()
+    with col_b:
+        opponents = sorted(data['opponent'].unique())
+        selected_opp = st.selectbox("2. Choose Opponent Defense", opponents)
+
+    # --- 4. PREDICTION LOGIC ---
+    p_df = data[data['player_name'] == selected_p]
+    p_pos = p_df['position'].iloc[-1]
+    p_avg = p_df['total_yds'].mean()
     
-    # Layout
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        st.subheader(f"{selected_p} ({p_pos}) Trends")
-        st.plotly_chart(px.line(p_df, x='week', y=t_stat, markers=True), use_container_width=True)
+    # Calculate Defense Modifier
+    # Logic: (Opponent Avg Allowed to Pos) / (League Avg Allowed to Pos)
+    opp_allowed = def_data[(def_data['opponent'] == selected_opp) & 
+                           (def_data['position'] == p_pos)]['total_yds']
     
-    with col2:
-        st.metric("Season Average", f"{avg_val:.1f} Yds")
-        v_line = st.number_input("Market Line", value=float(round(avg_val)))
-        edge = ((avg_val - v_line) / v_line) * 100 if v_line > 0 else 0
-        st.metric("Model Edge", f"{edge:.1f}%")
+    bench = league_benchmarks.get(p_pos, 1)
+    # If we have data on the opponent, use it; otherwise, neutral (1.0)
+    matchup_mod = (opp_allowed.iloc[0] / bench) if not opp_allowed.empty else 1.0
+    
+    # Final Calculation
+    proj_yds = p_avg * matchup_mod
+    
+    # --- 5. DASHBOARD DISPLAY ---
+    st.divider()
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Player Season Avg", f"{p_avg:.1f} Yds")
+    
+    # Color code the modifier
+    mod_delta = "Favorable" if matchup_mod > 1.05 else "Difficult" if matchup_mod < 0.95 else "Neutral"
+    m2.metric("Matchup Difficulty", f"{matchup_mod:.2f}x", delta=mod_delta)
+    
+    m3.metric("Projected Performance", f"{proj_yds:.1f} Yds", 
+              delta=f"{proj_yds - p_avg:+.1f} vs Avg", delta_color="normal")
+
+    # Visualizing Trend vs Defense
+    st.subheader(f"Recent Performance: {selected_p}")
+    fig = px.bar(p_df.tail(8), x='week', y='total_yds', color='total_yds',
+                 title="Total Yards - Last 8 Games",
+                 labels={'total_yds': 'Yards', 'week': 'Week'})
+    st.plotly_chart(fig, use_container_width=True)
 
 else:
-    st.warning("Data is still syncing or the source schema has changed. Please refresh.")
+    st.info("Please wait for the data to sync...")
