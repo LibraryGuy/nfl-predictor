@@ -1,90 +1,94 @@
 import streamlit as st
 import nflreadpy as nfl
 import pandas as pd
-from math import exp
 import plotly.express as px
+from math import exp
 
-# --- 1. CONFIG & SESSION ---
-st.set_page_config(page_title="NFL Genius: Lazy Loader", layout="wide")
+# --- 1. CONFIG ---
+st.set_page_config(page_title="NFL Genius Debugger", layout="wide")
 
+st.title("🏈 NFL Genius: Pro Builder")
+
+# Sidebar for Parlay
 if "parlay_legs" not in st.session_state:
     st.session_state.parlay_legs = []
-
-# --- 2. SELECT BEFORE LOADING ---
-st.title("🏈 NFL Genius: Pro Builder")
 
 with st.sidebar:
     st.header("📋 Parlay Builder")
     for leg in st.session_state.parlay_legs:
         st.success(f"{leg['player']}: {leg['pick']}")
-    if st.button("Reset"):
+    if st.button("Reset Parlay"):
         st.session_state.parlay_legs = []
         st.rerun()
 
-# Step 1: Input the player name manually or from a simple list
-# This prevents the app from crashing trying to "find" players in a broken file
-p_name = st.text_input("Enter Player Name (e.g., Justin Jefferson)", "Justin Jefferson")
+# --- 2. INPUT & SEARCH ---
+col_search, col_debug = st.columns([2, 1])
+with col_search:
+    p_input = st.text_input("Player Name (Try 'Jefferson' or 'Mahomes')", "Jefferson")
+with col_debug:
+    show_debug = st.checkbox("🐞 Peek at Raw Data")
 
-# --- 3. ON-DEMAND DATA ENGINE ---
+# --- 3. DATA ENGINE ---
 @st.cache_data(ttl=3600)
-def get_player_data(name):
+def load_nfl_data():
     try:
-        # We only pull 2024-2025 data
+        # Loading 2024 and 2025
         df = nfl.load_player_stats(seasons=[2024, 2025]).to_pandas()
         
-        # Immediate Flattening to prevent the AttributeError
+        # FIX 1: Flatten MultiIndex (The AttributeError culprit)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [col[1] if col[1] else col[0] for col in df.columns.values]
-            
-        # Standardize 'player_name'
-        if 'player_display_name' in df.columns:
-            df = df.rename(columns={'player_display_name': 'player_name'})
-            
-        # Filter strictly for the chosen player
-        p_df = df[df['player_name'].str.contains(name, case=False, na=False)]
         
-        # Calculate Defense Stats on the fly for their position
-        if not p_df.empty:
-            pos = p_df['position'].iloc[-1]
-            def_df = df.groupby(['opponent', 'position']).agg({
-                'receiving_yards': 'mean',
-                'rushing_yards': 'mean',
-                'rushing_tds': 'mean',
-                'receiving_tds': 'mean'
-            }).reset_index()
-            return p_df, def_df
-        return pd.DataFrame(), pd.DataFrame()
+        # FIX 2: Standardize Name Columns
+        # nflreadpy often uses 'player_display_name'
+        if 'player_display_name' in df.columns and 'player_name' not in df.columns:
+            df['player_name'] = df['player_display_name']
+            
+        return df.fillna(0)
     except Exception as e:
-        return pd.DataFrame(), pd.DataFrame()
+        st.error(f"Error loading data: {e}")
+        return pd.DataFrame()
 
-# Step 2: Only load when the user is ready
-if p_name:
-    data, def_data = get_player_data(p_name)
+data = load_nfl_data()
+
+# --- 4. DEBUGGER & FILTER ---
+if show_debug and not data.empty:
+    st.write("### Data Preview (First 5 Rows)")
+    st.dataframe(data.head())
+    st.write("### Available Columns:")
+    st.write(list(data.columns))
+
+if not data.empty and p_input:
+    # We use a case-insensitive 'contains' search to find "Justin Jefferson" even if you type "Jefferson"
+    results = data[data['player_name'].str.contains(p_input, case=False, na=False)]
     
-    if not data.empty:
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            st.subheader(f"Analyzing: {p_name}")
-            opp = st.selectbox("Opponent", sorted(data['opponent'].unique()))
-            line = st.number_input("Vegas Line", value=75.5)
+    if not results.empty:
+        # If multiple players match (e.g., 'Jones'), let user pick one
+        unique_matches = results['player_name'].unique()
+        selected_p = st.selectbox("Confirm Player", unique_matches)
+        
+        # Filter down to the specific player
+        p_df = data[data['player_name'] == selected_p]
+        p_pos = p_df['position'].iloc[-1]
+        
+        # --- UI LAYOUT ---
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            st.subheader(f"Analytics for {selected_p}")
+            opp = st.selectbox("Opponent Defense", sorted(data['opponent'].unique()))
+            line = st.number_input("Market Line (Yards)", value=70.5)
             
-            # Defense Mod Logic
-            p_pos = data['position'].iloc[-1]
-            d_match = def_data[(def_data['opponent'] == opp) & (def_data['position'] == p_pos)]
-            mod = 1.15 if (not d_match.empty and d_match['receiving_yards'].iloc[0] > 55) else 0.95
-            
-            # Projections
-            avg_yds = data['receiving_yards'].mean() if p_pos in ['WR', 'TE'] else data['rushing_yards'].mean()
-            proj = avg_yds * mod
-            edge = ((proj - line) / line) * 100
-            
-            st.metric("Model Projection", f"{proj:.1f} Yds", delta=f"{edge:.1f}% Edge")
+            # Simple Math: Project Yards based on Average
+            avg_yds = p_df['receiving_yards'].mean() if p_pos in ['WR', 'TE'] else p_df['rushing_yards'].mean()
+            st.metric("Season Average", f"{avg_yds:.1f} Yds")
             
             if st.button("Add to Parlay"):
-                st.session_state.parlay_legs.append({"player": p_name, "pick": f"Over {line}"})
+                st.session_state.parlay_legs.append({"player": selected_p, "pick": f"Over {line}"})
                 st.rerun()
 
-        with col2:
-            st.plotly_chart(px.bar(data, x='week', y='receiving_yards', title="Weekly Yards"))
+        with c2:
+            fig = px.bar(p_df, x='week', y='receiving_yards' if p_pos in ['WR', 'TE'] else 'rushing_yards', 
+                         title=f"Weekly Production")
+            st.plotly_chart(fig)
     else:
-        st.warning(f"No data found for '{p_name}'. Please check the spelling.")
+        st.error(f"Could not find '{p_input}' in the dataset. Try a shorter name (e.g., just 'Jefferson').")
