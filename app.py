@@ -11,216 +11,126 @@ from nfl_stadiums import NFLStadiums
 # --- 1. SETTINGS & API CONFIG ---
 st.set_page_config(page_title="NFL Sharp: Intelligence Hub", layout="wide", page_icon="🏈")
 
-# --- INITIALIZE SESSION STATE KEYS ---
-if "w_temp_val" not in st.session_state:
-    st.session_state["w_temp_val"] = 70
-if "w_wind_val" not in st.session_state:
-    st.session_state["w_wind_val"] = 0
-if "w_precip_val" not in st.session_state:
-    st.session_state["w_precip_val"] = "None"
-if "last_stadium_query" not in st.session_state:
-    st.session_state["last_stadium_query"] = ""
+if "w_temp_val" not in st.session_state: st.session_state["w_temp_val"] = 70
+if "w_wind_val" not in st.session_state: st.session_state["w_wind_val"] = 0
+if "w_precip_val" not in st.session_state: st.session_state["w_precip_val"] = "None"
+if "last_stadium_query" not in st.session_state: st.session_state["last_stadium_query"] = ""
 
-# --- STADIUM OVERRIDES ---
-FORCE_OUTDOOR = [
-    "Gillette Stadium", "Lumen Field", "Hard Rock Stadium", 
-    "Acrisure Stadium", "GEHA Field at Arrowhead Stadium",
-    "Highmark Stadium", "Lambeau Field", "Soldier Field"
-]
+FORCE_OUTDOOR = ["Gillette Stadium", "Lumen Field", "Hard Rock Stadium", "Acrisure Stadium", "Lambeau Field"]
 
-# --- AUTOMATED WEATHER FETCH ---
+# --- 2. LOGIC FUNCTIONS ---
 def fetch_stadium_weather(lat, lon, game_time):
     try:
         url = "https://api.open-meteo.com/v1/forecast"
-        params = {
-            "latitude": lat, "longitude": lon,
-            "hourly": ["temperature_2m", "precipitation", "wind_speed_10m"],
-            "temperature_unit": "fahrenheit", "wind_speed_unit": "mph",
-            "timezone": "auto", "forecast_days": 7
-        }
-        response = requests.get(url, params=params, timeout=5).json()
-        hourly = response.get('hourly', {})
-        times = hourly.get('time', [])
+        params = {"latitude": lat, "longitude": lon, "hourly": ["temperature_2m", "precipitation", "wind_speed_10m"], "temperature_unit": "fahrenheit", "wind_speed_unit": "mph", "timezone": "auto"}
+        res = requests.get(url, params=params, timeout=5).json()
         target_str = datetime.now().strftime(f"%Y-%m-%dT{game_time.strftime('%H')}:00")
-        idx = times.index(target_str) if target_str in times else 0
-        temp = hourly.get('temperature_2m', [70])[idx]
-        wind = hourly.get('wind_speed_10m', [0])[idx]
-        precip_val = hourly.get('precipitation', [0])[idx]
-        precip_type = "None"
-        if precip_val > 0.1: precip_type = "Rain"
-        if temp < 32 and precip_val > 0: precip_type = "Snow"
-        return temp, wind, precip_type
-    except Exception:
-        return 70, 0, "None"
+        idx = res['hourly']['time'].index(target_str) if target_str in res['hourly']['time'] else 0
+        t, w, p_v = res['hourly']['temperature_2m'][idx], res['hourly']['wind_speed_10m'][idx], res['hourly']['precipitation'][idx]
+        p_t = "Rain" if p_v > 0.1 else "Snow" if (t < 32 and p_v > 0) else "None"
+        return t, w, p_t
+    except: return 70, 0, "None"
 
-# --- WEATHER IMPACT LOGIC ---
-def get_weather_multiplier(roof_type, wind, temp, precip, p_pos):
-    if any(x in roof_type.lower() for x in ['dome', 'closed', 'indoor']):
-        return 1.0, "Dome (No Impact)"
-    multiplier, impact_reasons = 1.0, []
+def get_weather_multiplier(roof, wind, temp, precip, pos):
+    if any(x in roof.lower() for x in ['dome', 'closed', 'indoor']): return 1.0, "Dome"
+    m, reasons = 1.0, []
     if wind >= 15:
-        penalty = 0.05 if wind < 20 else 0.12
-        if p_pos in ['QB', 'WR', 'TE']:
-            multiplier -= penalty
-            impact_reasons.append(f"High Wind (-{int(penalty*100)}%)")
-        elif p_pos == 'RB':
-            multiplier += 0.03
-            impact_reasons.append("Wind Vol. Boost (+3%)")
-    if precip in ['Rain', 'Snow']:
-        multiplier -= 0.05
-        impact_reasons.append(f"{precip} (-5%)")
-    if temp <= 20:
-        multiplier -= 0.03
-        impact_reasons.append("Extreme Cold (-3%)")
-    return round(multiplier, 2), (" + ".join(impact_reasons) if impact_reasons else "Fair Weather")
+        p = 0.05 if wind < 20 else 0.12
+        if pos in ['QB', 'WR', 'TE']: m -= p; reasons.append(f"Wind (-{int(p*100)}%)")
+        else: m += 0.03; reasons.append("Wind Vol. (+3%)")
+    if precip != "None": m -= 0.05; reasons.append(f"{precip} (-5%)")
+    return round(m, 2), (" + ".join(reasons) if reasons else "Fair")
 
-# --- PARLAY GENERATION LOGIC ---
-def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, data, risk_level, is_td=False):
-    risk_map = {
-        "Conservative (-104)": {"offset": -0.6, "label": "Floor"},
-        "Standard (+105)": {"offset": 0.0, "label": "Mean"},
-        "Aggressive (+200)": {"offset": 0.6, "label": "Ceiling"}
-    }
-    offset = risk_map[risk_level]["offset"]
+def generate_smart_legs(p_name, p_pos, p_team, p_mean, p_std, stat_label, data, risk_level, is_td):
+    # 1. Base Market Leg
+    risk_map = {"Conservative (-104)": -0.5, "Standard (+105)": 0.0, "Aggressive (+200)": 0.5}
+    primary_val = max(0.5 if is_td else 0, round(p_mean + (risk_map[risk_level] * p_std)))
+    legs = [{"label": f"{p_name}: {primary_val}+ {stat_label}", "type": "Primary", "color": "info"}]
     
-    if is_td:
-        primary_val = 0.5 if risk_level != "Aggressive (+200)" else 1.5
-    else:
-        primary_val = max(0, round(p_mean + (offset * p_std)))
+    # 2. AVOID LEG (The "Under" Logic)
+    # Use Poisson to find P(X=0). If mean is 0.4, P(0) = e^-0.4
+    prob_zero = poisson.pmf(0, p_mean) 
+    td_market_name = "Passing TD" if p_pos == "QB" else "Anytime TD"
     
-    parlay_legs = [{"label": f"{selected_p}: {primary_val}+ {stat_label}", "type": risk_map[risk_level]["label"]}]
-    
-    # Teammate Correlation Logic
-    teammates = data[(data['team'] == p_team) & (data['player_name'] != selected_p)].sort_values(['season', 'week'], ascending=False)
-    if not teammates.empty:
-        latest_season = teammates['season'].max()
+    if prob_zero > 0.55: # If >55% chance of 0 TDs
+        legs.append({"label": f"AVOID: {p_name} {td_market_name} (Prob 0: {int(prob_zero*100)}%)", "type": "Risk Alert", "color": "error"})
+
+    # 3. Teammate Correlation
+    tm = data[(data['team'] == p_team) & (data['player_name'] != p_name)].tail(10)
+    if not tm.empty:
         if p_pos == 'QB':
-            valid_targets = teammates[(teammates['season'] == latest_season) & (teammates['position'].isin(['WR', 'TE']))]
-            if not valid_targets.empty:
-                top_target = valid_targets.groupby('player_name')['receiving_yards'].sum().idxmax()
-                leg_val = 40 if risk_level == "Conservative (-104)" else 60
-                parlay_legs.append({"label": f"{top_target}: {leg_val}+ Rec Yds", "type": "Teammate Stack"})
-        elif p_pos in ['WR', 'TE', 'RB']:
-            current_qbs = teammates[(teammates['position'] == 'QB') & (teammates['season'] == latest_season)]
-            if not current_qbs.empty:
-                qb_name = current_qbs[current_qbs['week'] == current_qbs['week'].max()]['player_name'].iloc[0]
-                leg_val = 195 if risk_level == "Conservative (-104)" else 240
-                parlay_legs.append({"label": f"{qb_name}: {leg_val}+ Pass Yds", "type": "QB Link"})
-    return parlay_legs
+            tgt = tm[tm['position'].isin(['WR', 'TE'])].groupby('player_name')['receiving_yards'].mean().idxmax()
+            legs.append({"label": f"{tgt}: 40+ Rec Yds", "type": "Correlation", "color": "success"})
+        else:
+            qb = tm[tm['position'] == 'QB']['player_name'].iloc[-1] if 'QB' in tm['position'].values else "QB"
+            legs.append({"label": f"{qb}: 200+ Pass Yds", "type": "QB Stack", "color": "success"})
+    return legs
 
-# --- 2. CORE LOGIC & DATA LOADING ---
+# --- 3. DATA & UI ---
 @st.cache_data(ttl=3600)
-def load_data_pro():
-    try:
-        df = nfl.load_player_stats(seasons=[2024, 2025]).to_pandas()
-        df = df.rename(columns={'player_display_name': 'player_name', 'recent_team': 'team', 'opponent_team': 'opponent'})
-        df = df.loc[:, ~df.columns.duplicated()].copy()
-        for col in ['passing_yards', 'rushing_yards', 'receiving_yards', 'receptions', 'passing_tds', 'rushing_tds', 'receiving_tds']:
-            df[col] = df.get(col, 0).fillna(0)
-        return df.dropna(subset=['player_name', 'opponent', 'position'])
-    except Exception as e:
-        st.error(f"Sync Failure: {e}")
-        return pd.DataFrame()
+def load_data():
+    df = nfl.load_player_stats(seasons=[2024, 2025]).to_pandas()
+    df = df.rename(columns={'player_display_name': 'player_name', 'recent_team': 'team', 'opponent_team': 'opponent'})
+    for c in ['passing_yards','rushing_yards','receiving_yards','passing_tds','rushing_tds','receiving_tds']: df[c] = df.get(c, 0).fillna(0)
+    return df.dropna(subset=['player_name', 'opponent', 'position'])
 
-raw_data = load_data_pro()
-data = raw_data if isinstance(raw_data, pd.DataFrame) else pd.DataFrame()
+data = load_data()
 stadium_client = NFLStadiums()
 
-# --- 3. UI RENDERING ---
 if not data.empty:
     with st.sidebar:
-        st.header("🎯 Target Selection")
-        selected_p = st.selectbox("Select Player", sorted(data['player_name'].unique()))
-        selected_opp = st.selectbox("Opponent Defense", sorted(data['opponent'].unique()))
+        st.header("🎯 Selection")
+        sel_p = st.selectbox("Player", sorted(data['player_name'].unique()))
+        p_df = data[data['player_name'] == sel_p].copy()
+        p_pos, p_team = p_df['position'].iloc[-1], p_df['team'].iloc[-1]
         
-        p_df = data[data['player_name'] == selected_p].copy()
-        p_team = p_df['team'].iloc[-1] if not p_df.empty else "N/A"
-        p_pos = p_df['position'].iloc[-1] if not p_df.empty else "WR"
-
-        selected_market = st.radio("Market Type", ["Yards", "Touchdowns"])
-        stat_col = ('passing_yards' if p_pos == 'QB' else 'rushing_yards' if p_pos == 'RB' else 'receiving_yards') if selected_market == "Yards" else ('passing_tds' if p_pos == 'QB' else 'rushing_tds' if p_pos == 'RB' else 'receiving_tds')
-        is_td_market = "tds" in stat_col
-        market_line = st.number_input("Sportsbook Line", value=0.5 if is_td_market else 50.0, step=0.5)
-        
-        risk_pref = st.radio("Target Odds Profile", ["Conservative (-104)", "Standard (+105)", "Aggressive (+200)"], index=1)
-        
-        st.subheader("🏟️ Venue & Weather")
-        sel_stad_name = st.selectbox("Game Venue", sorted(stadium_client.get_list_of_stadium_names()))
-        game_time = st.time_input("Kickoff Time (Local)", time(13, 0))
-        
-        stad_obj = stadium_client.get_stadium_by_name(sel_stad_name)
-        roof_type_raw = str(stad_obj.get('roof_type', 'Outdoor'))
-        is_forced_outdoor = any(s in sel_stad_name for s in FORCE_OUTDOOR)
-        is_actually_indoor = any(x in roof_type_raw.lower() for x in ['dome', 'closed', 'indoor']) and not is_forced_outdoor
-
-        if is_actually_indoor:
-            st.success(f"🏟️ Indoor: Conditions Controlled")
-            w_wind, w_temp, w_precip = 0, 70, "None"
+        mkt = st.radio("Market", ["Yards", "Touchdowns"])
+        if mkt == "Yards":
+            stat_col = 'passing_yards' if p_pos == 'QB' else 'rushing_yards' if p_pos == 'RB' else 'receiving_yards'
         else:
-            lat, lon = (stad_obj.get('latitude'), stad_obj.get('longitude')) if stad_obj else (None, None)
-            query_key = f"{sel_stad_name}_{game_time.hour}"
-            if st.session_state["last_stadium_query"] != query_key and lat and lon:
-                with st.spinner(f"Fetching Live Forecast..."):
-                    l_temp, l_wind, l_precip = fetch_stadium_weather(lat, lon, game_time)
-                    st.session_state["w_temp_val"] = int(l_temp)
-                    st.session_state["w_wind_val"] = int(l_wind)
-                    st.session_state["w_precip_val"] = l_precip
-                    st.session_state["last_stadium_query"] = query_key
-
-            w_temp = st.slider("Temperature (F)", -10, 100, key="w_temp_val")
-            w_wind = st.slider("Wind Speed (MPH)", 0, 40, key="w_wind_val")
-            p_opts = ["None", "Rain", "Snow"]
-            def_p_idx = p_opts.index(st.session_state.get("w_precip_val", "None"))
-            w_precip = st.selectbox("Precipitation", p_opts, index=def_p_idx)
-
-    # --- CALCULATION LOGIC ---
-    p_mean = p_df[stat_col].mean()
-    p_std = p_df[stat_col].std() if len(p_df) > 1 else (p_mean * 0.4)
-    weather_mult, weather_reason = get_weather_multiplier(roof_type_raw if not is_forced_outdoor else "Outdoor", w_wind, w_temp, w_precip, p_pos)
-    model_proj = p_mean * weather_mult
-    win_prob = (1 - poisson.cdf(max(0, market_line - 0.5), model_proj)) * 100 if is_td_market else (1 - norm.cdf(market_line, model_proj, p_std)) * 100
-
-    # --- DASHBOARD STRUCTURAL ALIGNMENT ---
-    st.title(f"📊 {selected_p} Intelligence Hub")
-    
-    c1, c2 = st.columns([2, 1])
-    
-    with c1:
-        st.metric(
-            label="Model Projection", 
-            value=f"{round(model_proj, 1)} {selected_market}", 
-            delta=f"Prob > Line: {round(win_prob, 1)}%"
-        )
+            stat_col = 'passing_tds' if p_pos == 'QB' else 'receiving_tds' # Simplified for logic
         
-        # Historical Performance Chart
+        line = st.number_input("Line", value=0.5 if "tds" in stat_col else 50.0)
+        risk = st.radio("Odds Profile", ["Conservative (-104)", "Standard (+105)", "Aggressive (+200)"], index=1)
+        
+        st.subheader("🏟️ Weather")
+        venue = st.selectbox("Venue", sorted(stadium_client.get_list_of_stadium_names()))
+        time_in = st.time_input("Kickoff", time(13, 0))
+        stad = stadium_client.get_stadium_by_name(venue)
+        is_outdoor = not any(x in str(stad.get('roof_type','')).lower() for x in ['dome','closed']) or any(s in venue for s in FORCE_OUTDOOR)
+        
+        if is_outdoor:
+            q_key = f"{venue}_{time_in.hour}"
+            if st.session_state.last_stadium_query != q_key:
+                st.session_state.w_temp_val, st.session_state.w_wind_val, st.session_state.w_precip_val = fetch_stadium_weather(stad['latitude'], stad['longitude'], time_in)
+                st.session_state.last_stadium_query = q_key
+            w_t = st.slider("Temp", -10, 100, key="w_temp_val")
+            w_w = st.slider("Wind", 0, 40, key="w_wind_val")
+            w_p = st.selectbox("Precip", ["None", "Rain", "Snow"], index=["None","Rain","Snow"].index(st.session_state.w_precip_val))
+        else: w_t, w_w, w_p = 70, 0, "None"
+
+    # --- FINAL CALCULATIONS ---
+    p_mean, p_std = p_df[stat_col].mean(), (p_df[stat_col].std() if len(p_df)>1 else p_df[stat_col].mean()*0.4)
+    w_m, w_r = get_weather_multiplier("Outdoor" if is_outdoor else "Dome", w_w, w_t, w_p, p_pos)
+    model_proj = p_mean * w_m
+    prob = (1 - poisson.cdf(max(0, line-0.5), model_proj))*100 if "tds" in stat_col else (1 - norm.cdf(line, model_proj, p_std))*100
+
+    # --- DASHBOARD ---
+    st.title(f"📊 {sel_p} Intelligence Hub")
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        st.metric("Model Projection", f"{round(model_proj, 1)} {mkt}", f"{round(prob, 1)}% Prob")
         if not p_df.empty:
-            last_5 = p_df.tail(5).copy()
-            last_5['hit'] = last_5[stat_col] >= market_line
-            fig = go.Figure(go.Bar(
-                x=[f"Wk {w}" for w in last_5['week']], 
-                y=last_5[stat_col], 
-                marker_color=['#00ff96' if h else '#4a4a4a' for h in last_5['hit']]
-            ))
-            fig.add_hline(y=market_line, line_dash="dash", line_color="#ff4b4b", annotation_text="Line")
-            fig.update_layout(title="Last 5 Games vs Current Line", template="plotly_dark", height=300)
+            fig = go.Figure(go.Bar(x=[f"Wk {w}" for w in p_df.tail(5)['week']], y=p_df.tail(5)[stat_col], marker_color='#00ff96'))
+            fig.add_hline(y=line, line_dash="dash", line_color="#ff4b4b")
+            fig.update_layout(template="plotly_dark", height=300, margin=dict(l=20,r=20,t=40,b=20))
             st.plotly_chart(fig, use_container_width=True)
 
     with c2:
         st.subheader("🚀 Smart Parlay Legs")
+        for leg in generate_smart_legs(sel_p, p_pos, p_team, model_proj, p_std, mkt, data, risk, "tds" in stat_col):
+            if leg['color'] == "error": st.error(f"⚠️ {leg['label']}")
+            elif leg['color'] == "success": st.success(f"🔗 {leg['label']}")
+            else: st.info(f"🔹 {leg['label']}")
         
-        # Call the parlay generator
-        parlay_legs = generate_risk_parlay(
-            selected_p, p_pos, p_team, model_proj, p_std, 
-            selected_market, data, risk_pref, is_td_market
-        )
-        
-        # Render the legs
-        for leg in parlay_legs:
-            st.info(f"🔹 **{leg['type']}**: {leg['label']}")
-            
-        st.divider()
-        st.subheader("🌦️ Weather Impact")
-        st.write(f"**Factor Summary**: {weather_reason}")
-        
-        if not is_actually_indoor:
-            st.caption(f"Syncing live weather for outdoor venue: {sel_stad_name}")
+        st.write(f"**Weather Impact**: {w_r}")
