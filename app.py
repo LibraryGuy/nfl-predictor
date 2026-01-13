@@ -20,9 +20,9 @@ def get_dynamic_sos(data, stat_col):
     def_strength = data.groupby('opponent')[stat_col].mean() / league_avg
     return def_strength.to_dict()
 
-# --- PARLAY ENGINE (TEAMMATE CORRELATION) ---
+# --- UPDATED PARLAY ENGINE (TEAMMATE STACKING) ---
 def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, data, risk_level):
-    """Calculates parlay legs using Teammate Stacking (Positive Correlation)."""
+    """Calculates parlay legs using Positive Teammate Correlation (The Stack)."""
     risk_map = {
         "Conservative (-104)": {"offset": -0.6, "label": "Floor"},
         "Standard (+105)": {"offset": 0.0, "label": "Mean"},
@@ -33,33 +33,33 @@ def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, d
     primary_val = round(p_mean + (offset * p_std))
     parlay_legs = [{"label": f"{selected_p}: {max(0, primary_val)}+ {stat_label}", "type": risk_map[risk_level]["label"]}]
     
-    # Filter for Teammates only
+    # Identify Teammates
     teammates = data[(data['team'] == p_team) & (data['player_name'] != selected_p)]
     
     if not teammates.empty:
-        # Scenario A: Selected player is a QB -> Pair with top WR/TE (The "Stack")
+        # 1. QB Selected -> Find Top WR/TE (The "Pass-Catch" Stack)
         if p_pos == 'QB':
             top_target = teammates[teammates['position'].isin(['WR', 'TE'])].groupby('player_name')['receiving_yards'].sum().idxmax()
-            # Set target yardage based on risk tier
-            leg_val = 40 if risk_level == "Conservative (-104)" else 65
+            # Threshold varies by risk tier
+            leg_val = 40 if risk_level == "Conservative (-104)" else 60
             parlay_legs.append({"label": f"{top_target}: {leg_val}+ Rec Yds", "type": "Teammate Stack"})
             
-        # Scenario B: Selected player is a WR/TE -> Pair with their QB (The "Link")
+        # 2. WR/TE Selected -> Find QB (The "Target-Volume" Link)
         elif p_pos in ['WR', 'TE']:
-            team_qb = teammates[teammates['position'] == 'QB']['player_name'].unique()
-            if len(team_qb) > 0:
-                qb_name = team_qb[0]
-                leg_val = 215 if risk_level == "Conservative (-104)" else 265
+            team_qb_list = teammates[teammates['position'] == 'QB']['player_name'].unique()
+            if len(team_qb_list) > 0:
+                qb_name = team_qb_list[0]
+                leg_val = 215 if risk_level == "Conservative (-104)" else 255
                 parlay_legs.append({"label": f"{qb_name}: {leg_val}+ Pass Yds", "type": "QB Link"})
                 
-        # Scenario C: Selected player is a RB -> Pair with QB (Correlates with team offensive success)
+        # 3. RB Selected -> Find QB (The "Offensive Flow" Stack)
         elif p_pos == 'RB':
-            team_qb = teammates[teammates['position'] == 'QB']['player_name'].unique()
-            if len(team_qb) > 0:
-                qb_name = team_qb[0]
-                leg_val = 200 if risk_level == "Conservative (-104)" else 250
-                parlay_legs.append({"label": f"{qb_name}: {leg_val}+ Pass Yds", "type": "Offensive Flow"})
-
+            team_qb_list = teammates[teammates['position'] == 'QB']['player_name'].unique()
+            if len(team_qb_list) > 0:
+                qb_name = team_qb_list[0]
+                leg_val = 195 if risk_level == "Conservative (-104)" else 240
+                parlay_legs.append({"label": f"{qb_name}: {leg_val}+ Pass Yds", "type": "Team Success"})
+                
     return parlay_legs
 
 # --- API HELPER ---
@@ -96,7 +96,7 @@ def load_data_pro():
     except Exception as e:
         st.error(f"Sync Failure: {e}"); return pd.DataFrame(), pd.DataFrame()
 
-# --- MAIN LOGIC ---
+# --- MAIN UI LOGIC ---
 data, schedules = load_data_pro()
 stadium_client = NFLStadiums()
 
@@ -153,6 +153,7 @@ if not data.empty:
                     'WR': ('receiving_yards', 'receiving_tds', 'Rec Yds'), 'TE': ('receiving_yards', 'receiving_tds', 'Rec Yds')}
         stat_col, td_col, stat_label = stat_map.get(p_pos, ('receiving_yards', 'receiving_tds', 'Yds'))
 
+        # SHARP PROJECTION SNIPPET
         p_mean = p_df[stat_col].mean()
         p_std = p_df[stat_col].std() if len(p_df) > 1 else 1.0
         
@@ -161,24 +162,49 @@ if not data.empty:
         script_boost = {"Defensive Struggle": 0.90, "Balanced": 1.0, "Shootout": 1.15}[game_script]
         model_proj = p_mean * script_boost * sos_multiplier
 
+        # UI RENDERING
         st.title(f"📊 {selected_p} Intelligence Hub")
         
         col_main, col_side = st.columns([2, 1])
+        
         with col_main:
-            # Money tracker and Hit charts remain here...
             st.subheader("🏦 Sportsbook Money Tracker")
             fig_money = go.Figure()
             fig_money.add_trace(go.Bar(name='Tickets (Public)', x=['Market Sentiment'], y=[ticket_pct], marker_color='#4a4a4a'))
             fig_money.add_trace(go.Bar(name='Handle (Sharps)', x=['Market Sentiment'], y=[handle_pct], marker_color='#00ff96'))
             st.plotly_chart(fig_money, use_container_width=True)
 
+            risk_offsets = {"Conservative (-104)": -0.6, "Standard (+105)": 0, "Aggressive (+200)": 0.6}
+            target_line = round(model_proj + (risk_offsets[risk_pref] * p_std))
+            
+            last_5 = p_df.tail(5).copy()
+            last_5['hit'] = last_5[stat_col] >= target_line
+            fig_hits = go.Figure(go.Bar(x=[f"Wk {w}" for w in last_5['week']], y=last_5[stat_col], marker_color=['#00ff96' if hit else '#4a4a4a' for hit in last_5['hit']]))
+            fig_hits.add_hline(y=target_line, line_dash="dash", line_color="#ff4b4b")
+            fig_hits.update_layout(title=f"Last 5 Games vs {risk_pref} Target ({target_line}+)", template="plotly_dark", height=250)
+            st.plotly_chart(fig_hits, use_container_width=True)
+
         with col_side:
+            st.subheader("📋 Historical Averages")
+            avg_data = {"Metric": [stat_label, "Touchdowns"], "Season": [round(p_mean, 1), round(p_df[td_col].mean(), 2)], "Last 5": [round(last_5[stat_col].mean(), 1), round(last_5[td_col].mean(), 2)]}
+            st.table(pd.DataFrame(avg_data))
+            
+            st.divider()
             st.subheader("🚀 Teammate Stacking Parlays")
             t1, t2, t3 = st.tabs(["🛡️ Cons.", "✅ Std.", "🔥 Aggr."])
             
             for tab, r_name in zip([t1, t2, t3], ["Conservative (-104)", "Standard (+105)", "Aggressive (+200)"]):
                 with tab:
-                    # UPDATED CALL TO USE TEAMMATE LOGIC
+                    # Pass the player team and existing data to the new stacking logic
                     parlay_legs = generate_risk_parlay(selected_p, p_pos, p_team, model_proj, p_std, stat_label, data, r_name)
                     for leg in parlay_legs:
                         st.write(f"🔹 **{leg['type']}**: {leg['label']}")
+                    
+                    tier_v = round(model_proj + (risk_offsets[r_name] * p_std))
+                    tier_h = (last_5[stat_col] >= tier_v).sum()
+                    st.caption(f"Historical Hit Rate: {tier_h}/5 Games")
+
+            st.divider()
+            hit_count = last_5['hit'].sum()
+            st.write(f"**Consistency ({risk_pref.split(' ')[0]}):** {hit_count}/5 Games Hit")
+            st.progress(hit_count / 5)
