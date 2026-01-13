@@ -64,7 +64,7 @@ def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, d
 
 # ... [keep your data loading and sidebar code same] ...
 
-if not data.empty:
+if data is not None and isinstance(data, pd.DataFrame) and not data.empty:
     p_df = data[data['player_name'] == selected_p].copy()
     if not p_df.empty:
         # ... [keep stat_map and weather_multiplier code same] ...
@@ -90,3 +90,4 @@ if not data.empty:
         # If the user is looking at a TD stat, tell the function to use Poisson
         is_td_stat = "td" in stat_col
         parlay_legs = generate_risk_parlay(selected_p, p_pos, p_team, model_proj_yards, p_std, stat_label, data, risk_pref, is_td=is_td_stat)
+
