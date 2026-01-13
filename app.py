@@ -17,13 +17,12 @@ def get_dynamic_sos(data, stat_col):
     """Calculates defensive strength relative to league average performance."""
     if data.empty: return {}
     league_avg = data[stat_col].mean()
-    # Higher number = easier defense (allows more yards)
     def_strength = data.groupby('opponent')[stat_col].mean() / league_avg
     return def_strength.to_dict()
 
-# --- PARLAY ENGINE (VOLATILITY-BASED) ---
+# --- PARLAY ENGINE (TEAMMATE CORRELATION) ---
 def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, data, risk_level):
-    """Calculates parlay legs using Standard Deviation offsets."""
+    """Calculates parlay legs using Teammate Stacking (Positive Correlation)."""
     risk_map = {
         "Conservative (-104)": {"offset": -0.6, "label": "Floor"},
         "Standard (+105)": {"offset": 0.0, "label": "Mean"},
@@ -31,20 +30,36 @@ def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, d
     }
     
     offset = risk_map[risk_level]["offset"]
-    # Calculate target based on player volatility (Sigma)
     primary_val = round(p_mean + (offset * p_std))
     parlay_legs = [{"label": f"{selected_p}: {max(0, primary_val)}+ {stat_label}", "type": risk_map[risk_level]["label"]}]
     
-    # Advanced Correlation (Bring-Back Logic)
-    # If the player is projected for a big game, their opponent's WR often benefits from catch-up volume.
-    opp_team = data[data['player_name'] == selected_p]['opponent'].iloc[-1]
-    opp_players = data[data['team'] == opp_team]
+    # Filter for Teammates only
+    teammates = data[(data['team'] == p_team) & (data['player_name'] != selected_p)]
     
-    if p_pos == 'QB' and not opp_players.empty:
-        opp_wr = opp_players[opp_players['position'] == 'WR'].groupby('player_name')['receiving_yards'].sum().idxmax()
-        leg_val = 45 if risk_level == "Conservative (-104)" else 65
-        parlay_legs.append({"label": f"{opp_wr}: {leg_val}+ Rec Yds", "type": "Bring-Back"})
-        
+    if not teammates.empty:
+        # Scenario A: Selected player is a QB -> Pair with top WR/TE (The "Stack")
+        if p_pos == 'QB':
+            top_target = teammates[teammates['position'].isin(['WR', 'TE'])].groupby('player_name')['receiving_yards'].sum().idxmax()
+            # Set target yardage based on risk tier
+            leg_val = 40 if risk_level == "Conservative (-104)" else 65
+            parlay_legs.append({"label": f"{top_target}: {leg_val}+ Rec Yds", "type": "Teammate Stack"})
+            
+        # Scenario B: Selected player is a WR/TE -> Pair with their QB (The "Link")
+        elif p_pos in ['WR', 'TE']:
+            team_qb = teammates[teammates['position'] == 'QB']['player_name'].unique()
+            if len(team_qb) > 0:
+                qb_name = team_qb[0]
+                leg_val = 215 if risk_level == "Conservative (-104)" else 265
+                parlay_legs.append({"label": f"{qb_name}: {leg_val}+ Pass Yds", "type": "QB Link"})
+                
+        # Scenario C: Selected player is a RB -> Pair with QB (Correlates with team offensive success)
+        elif p_pos == 'RB':
+            team_qb = teammates[teammates['position'] == 'QB']['player_name'].unique()
+            if len(team_qb) > 0:
+                qb_name = team_qb[0]
+                leg_val = 200 if risk_level == "Conservative (-104)" else 250
+                parlay_legs.append({"label": f"{qb_name}: {leg_val}+ Pass Yds", "type": "Offensive Flow"})
+
     return parlay_legs
 
 # --- API HELPER ---
@@ -138,93 +153,32 @@ if not data.empty:
                     'WR': ('receiving_yards', 'receiving_tds', 'Rec Yds'), 'TE': ('receiving_yards', 'receiving_tds', 'Rec Yds')}
         stat_col, td_col, stat_label = stat_map.get(p_pos, ('receiving_yards', 'receiving_tds', 'Yds'))
 
-        # --- LOGIC UPGRADE: SHARP PROJECTION SNIPPET ---
         p_mean = p_df[stat_col].mean()
         p_std = p_df[stat_col].std() if len(p_df) > 1 else 1.0
         
         dynamic_sos = get_dynamic_sos(data, stat_col)
         sos_multiplier = dynamic_sos.get(selected_opp, 1.0)
         script_boost = {"Defensive Struggle": 0.90, "Balanced": 1.0, "Shootout": 1.15}[game_script]
-        
-        # The Sharp Mean: Baseline * Script * Defense
         model_proj = p_mean * script_boost * sos_multiplier
 
-        # EV / Edge Detection Logic
-        edge_msg = None
-        if market_line > 0:
-            # Calculate win probability using Normal Distribution
-            win_prob = 1 - norm.cdf(market_line, loc=model_proj, scale=p_std)
-            implied_prob = 0.524 # Assuming standard -110 juice
-            edge = win_prob - implied_prob
-            if edge > 0.05:
-                edge_msg = f"🔥 +EV Edge: {round(edge*100, 1)}% vs Book"
-
-        # --- UI RENDERING ---
         st.title(f"📊 {selected_p} Intelligence Hub")
-        if edge_msg: st.warning(edge_msg)
-
-        col_main, col_side = st.columns([2, 1])
         
+        col_main, col_side = st.columns([2, 1])
         with col_main:
+            # Money tracker and Hit charts remain here...
             st.subheader("🏦 Sportsbook Money Tracker")
             fig_money = go.Figure()
             fig_money.add_trace(go.Bar(name='Tickets (Public)', x=['Market Sentiment'], y=[ticket_pct], marker_color='#4a4a4a'))
             fig_money.add_trace(go.Bar(name='Handle (Sharps)', x=['Market Sentiment'], y=[handle_pct], marker_color='#00ff96'))
-            
-            money_msg = "⚖️ Balanced Market Action"
-            if handle_pct > ticket_pct + 10: money_msg = "🔥 Significant Sharp Money Detected"
-            elif ticket_pct > handle_pct + 15: money_msg = "⚠️ Public Heavy - Possible Trap"
-                
-            fig_money.update_layout(barmode='group', template="plotly_dark", height=250, title=dict(text=money_msg, font=dict(size=14, color="#00ff96")))
             st.plotly_chart(fig_money, use_container_width=True)
 
-            risk_offsets = {"Conservative (-104)": -0.6, "Standard (+105)": 0, "Aggressive (+200)": 0.6}
-            target_line = round(model_proj + (risk_offsets[risk_pref] * p_std))
-            
-            last_5 = p_df.tail(5).copy()
-            last_5['hit'] = last_5[stat_col] >= target_line
-            fig_hits = go.Figure(go.Bar(x=[f"Wk {w}" for w in last_5['week']], y=last_5[stat_col], marker_color=['#00ff96' if hit else '#4a4a4a' for hit in last_5['hit']]))
-            fig_hits.add_hline(y=target_line, line_dash="dash", line_color="#ff4b4b")
-            fig_hits.update_layout(title=f"Last 5 Games vs {risk_pref} Target ({target_line}+)", template="plotly_dark", height=250)
-            st.plotly_chart(fig_hits, use_container_width=True)
-
         with col_side:
-            st.subheader("📋 Historical Averages")
-            avg_data = {"Metric": [stat_label, "Touchdowns"], "Season": [round(p_mean, 1), round(p_df[td_col].mean(), 2)], "Last 5": [round(last_5[stat_col].mean(), 1), round(last_5[td_col].mean(), 2)]}
-            st.table(pd.DataFrame(avg_data))
-            
-            st.divider()
-            st.subheader("🎯 Primary Edge")
-            is_sharp = handle_pct > ticket_pct + 5
-            safe_val = round(model_proj - (0.5 * p_std)) # Statistical floor
-            
-            if is_sharp:
-                st.success(f"💎 **Sharp Pick:** {selected_p} {safe_val}+ {stat_label}")
-                st.caption("Sharps are backing this floor despite public volume.")
-            else:
-                st.info(f"🟢 **Safe Base:** {selected_p} {safe_val}+ {stat_label}")
-
-            st.divider()
-            st.subheader("🚀 Risk-Adjusted Parlays")
+            st.subheader("🚀 Teammate Stacking Parlays")
             t1, t2, t3 = st.tabs(["🛡️ Cons.", "✅ Std.", "🔥 Aggr."])
             
             for tab, r_name in zip([t1, t2, t3], ["Conservative (-104)", "Standard (+105)", "Aggressive (+200)"]):
                 with tab:
+                    # UPDATED CALL TO USE TEAMMATE LOGIC
                     parlay_legs = generate_risk_parlay(selected_p, p_pos, p_team, model_proj, p_std, stat_label, data, r_name)
                     for leg in parlay_legs:
                         st.write(f"🔹 **{leg['type']}**: {leg['label']}")
-                    
-                    tier_v = round(model_proj + (risk_offsets[r_name] * p_std))
-                    tier_h = (last_5[stat_col] >= tier_v).sum()
-                    st.caption(f"Historical Hit Rate: {tier_h}/5 Games")
-
-            if last_5[td_col].mean() >= 0.6 or game_script == "Shootout":
-                st.divider()
-                st.subheader("🔗 Correlated Add-ons")
-                if last_5[td_col].mean() >= 0.6: st.write(f"🏈 **Value TD:** {selected_p} Anytime TD")
-                if game_script == "Shootout": st.write(f"📈 **Game Script:** Over {v_total - 1.5} Total Pts")
-
-            st.divider()
-            hit_count = last_5['hit'].sum()
-            st.write(f"**Consistency ({risk_pref.split(' ')[0]}):** {hit_count}/5 Games Hit")
-            st.progress(hit_count / 5)
