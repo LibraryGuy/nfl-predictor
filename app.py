@@ -21,6 +21,14 @@ if "w_precip_val" not in st.session_state:
 if "last_stadium_query" not in st.session_state:
     st.session_state["last_stadium_query"] = ""
 
+# --- STADIUM OVERRIDES ---
+# These stadiums are often mislabeled as domes/indoor due to partial roofs or atriums
+FORCE_OUTDOOR = [
+    "Gillette Stadium", "Lumen Field", "Hard Rock Stadium", 
+    "Acrisure Stadium", "GEHA Field at Arrowhead Stadium",
+    "Highmark Stadium", "Lambeau Field", "Soldier Field"
+]
+
 # --- AUTOMATED WEATHER FETCH ---
 def fetch_stadium_weather(lat, lon, game_time):
     try:
@@ -51,8 +59,10 @@ def fetch_stadium_weather(lat, lon, game_time):
 
 # --- WEATHER IMPACT LOGIC ---
 def get_weather_multiplier(roof_type, wind, temp, precip, p_pos):
-    if roof_type in ['Dome', 'Closed', 'Indoor']:
+    # Check for actual domes or closed retractable roofs
+    if any(x in roof_type.lower() for x in ['dome', 'closed', 'indoor']):
         return 1.0, "Dome (No Impact)"
+    
     multiplier, impact_reasons = 1.0, []
     if wind >= 15:
         penalty = 0.05 if wind < 20 else 0.12
@@ -70,7 +80,7 @@ def get_weather_multiplier(roof_type, wind, temp, precip, p_pos):
         impact_reasons.append("Extreme Cold (-3%)")
     return round(multiplier, 2), (" + ".join(impact_reasons) if impact_reasons else "Fair Weather")
 
-# --- CORE LOGIC ---
+# --- CORE LOGIC & DATA LOADING (Keep original) ---
 def get_dynamic_sos(data, stat_col):
     if data.empty: return {}
     league_avg = data[stat_col].mean()
@@ -83,11 +93,7 @@ def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, d
         "Aggressive (+200)": {"offset": 0.6, "label": "Ceiling"}
     }
     offset = risk_map[risk_level]["offset"]
-    if is_td:
-        primary_val = 0.5 if risk_level != "Aggressive (+200)" else 1.5
-    else:
-        primary_val = max(0, round(p_mean + (offset * p_std)))
-    
+    primary_val = 0.5 if is_td and risk_level != "Aggressive (+200)" else 1.5 if is_td else max(0, round(p_mean + (offset * p_std)))
     parlay_legs = [{"label": f"{selected_p}: {primary_val}+ {stat_label}", "type": risk_map[risk_level]["label"]}]
     
     teammates = data[(data['team'] == p_team) & (data['player_name'] != selected_p)].sort_values(['season', 'week'], ascending=False)
@@ -99,12 +105,6 @@ def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, d
                 top_target = valid_targets.groupby('player_name')['receiving_yards'].sum().idxmax()
                 leg_val = 40 if risk_level == "Conservative (-104)" else 60
                 parlay_legs.append({"label": f"{top_target}: {leg_val}+ Rec Yds", "type": "Teammate Stack"})
-        elif p_pos in ['WR', 'TE', 'RB']:
-            current_qbs = teammates[(teammates['position'] == 'QB') & (teammates['season'] == latest_season)]
-            if not current_qbs.empty:
-                qb_name = current_qbs[current_qbs['week'] == current_qbs['week'].max()]['player_name'].iloc[0]
-                leg_val = 195 if risk_level == "Conservative (-104)" else 240
-                parlay_legs.append({"label": f"{qb_name}: {leg_val}+ Pass Yds", "type": "QB Link"})
     return parlay_legs
 
 @st.cache_data(ttl=3600)
@@ -112,8 +112,6 @@ def load_data_pro():
     try:
         df = nfl.load_player_stats(seasons=[2024, 2025]).to_pandas()
         sched = nfl.load_schedules(seasons=[2025]).to_pandas()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = ["_".join(filter(None, map(str, col))).strip() for col in df.columns.values]
         df = df.rename(columns={'player_display_name': 'player_name', 'recent_team': 'team', 'opponent_team': 'opponent'})
         df = df.loc[:, ~df.columns.duplicated()].copy()
         for col in ['passing_yards', 'rushing_yards', 'receiving_yards', 'receptions', 'passing_tds', 'rushing_tds', 'receiving_tds']:
@@ -123,11 +121,11 @@ def load_data_pro():
         st.error(f"Sync Failure: {e}")
         return pd.DataFrame(), pd.DataFrame()
 
-# --- 3. UI RENDERING ---
 raw_data, schedules = load_data_pro()
 data = raw_data if isinstance(raw_data, pd.DataFrame) else pd.DataFrame()
 stadium_client = NFLStadiums()
 
+# --- UI RENDERING ---
 if not data.empty:
     with st.sidebar:
         st.header("🎯 Target Selection")
@@ -138,77 +136,65 @@ if not data.empty:
         p_team = p_df['team'].iloc[-1] if not p_df.empty else "N/A"
         p_pos = p_df['position'].iloc[-1] if not p_df.empty else "WR"
 
-        stat_options = {
-            'Yards': ('passing_yards' if p_pos == 'QB' else 'rushing_yards' if p_pos == 'RB' else 'receiving_yards'),
-            'Touchdowns': ('passing_tds' if p_pos == 'QB' else 'rushing_tds' if p_pos == 'RB' else 'receiving_tds')
-        }
         selected_market = st.radio("Market Type", ["Yards", "Touchdowns"])
-        stat_col = stat_options[selected_market]
+        stat_col = ('passing_yards' if p_pos == 'QB' else 'rushing_yards' if p_pos == 'RB' else 'receiving_yards') if selected_market == "Yards" else ('passing_tds' if p_pos == 'QB' else 'rushing_tds' if p_pos == 'RB' else 'receiving_tds')
         is_td_market = "tds" in stat_col
 
         market_line = st.number_input("Sportsbook Line", value=0.5 if is_td_market else 50.0, step=0.5)
         risk_pref = st.radio("Target Odds Profile", ["Conservative (-104)", "Standard (+105)", "Aggressive (+200)"], index=1)
         
-        # --- FIXED WEATHER LOGIC ---
+        # --- ROBUST WEATHER LOGIC ---
         st.subheader("🏟️ Venue & Weather")
         sel_stad_name = st.selectbox("Game Venue", sorted(stadium_client.get_list_of_stadium_names()))
         game_time = st.time_input("Kickoff Time (Local)", time(13, 0))
         
         stad_obj = stadium_client.get_stadium_by_name(sel_stad_name)
-        roof_type = stad_obj.get('roof_type', 'Outdoor') if stad_obj else 'Outdoor'
-        lat, lon = (stad_obj.get('latitude'), stad_obj.get('longitude')) if stad_obj else (None, None)
+        roof_type_raw = str(stad_obj.get('roof_type', 'Outdoor'))
+        
+        # Determine if we should force Outdoor behavior
+        is_forced_outdoor = any(s in sel_stad_name for s in FORCE_OUTDOOR)
+        is_actually_indoor = any(x in roof_type_raw.lower() for x in ['dome', 'closed', 'indoor']) and not is_forced_outdoor
 
-        if roof_type in ['Dome', 'Closed', 'Indoor']:
-            st.success(f"Dome: Conditions Controlled")
+        if is_actually_indoor:
+            st.success(f"🏟️ Indoor: Conditions Controlled")
             w_wind, w_temp, w_precip = 0, 70, "None"
         else:
-            # Check if we need to fetch new data (triggers on stadium or time change)
+            lat, lon = (stad_obj.get('latitude'), stad_obj.get('longitude')) if stad_obj else (None, None)
             query_key = f"{sel_stad_name}_{game_time.hour}"
+            
             if st.session_state["last_stadium_query"] != query_key and lat and lon:
-                with st.spinner("Fetching Live Forecast..."):
+                with st.spinner(f"Syncing Live Weather..."):
                     l_temp, l_wind, l_precip = fetch_stadium_weather(lat, lon, game_time)
-                    # Update session state values
                     st.session_state["w_temp_val"] = int(l_temp)
                     st.session_state["w_wind_val"] = int(l_wind)
                     st.session_state["w_precip_val"] = l_precip
                     st.session_state["last_stadium_query"] = query_key
 
-            # Render sliders tied to session state
             w_temp = st.slider("Temperature (F)", -10, 100, key="w_temp_val")
             w_wind = st.slider("Wind Speed (MPH)", 0, 40, key="w_wind_val")
             p_opts = ["None", "Rain", "Snow"]
-            # Map precip to selection box index
             def_p_idx = p_opts.index(st.session_state.get("w_precip_val", "None"))
             w_precip = st.selectbox("Precipitation", p_opts, index=def_p_idx)
 
-    # --- Calculations ---
+    # --- Calculations & Main View ---
     p_mean = p_df[stat_col].mean()
     p_std = p_df[stat_col].std() if len(p_df) > 1 else (p_mean * 0.4)
-    weather_mult, weather_reason = get_weather_multiplier(roof_type, w_wind, w_temp, w_precip, p_pos)
-    sos_mult = get_dynamic_sos(data, stat_col).get(selected_opp, 1.0)
-    model_proj = p_mean * sos_mult * weather_mult
+    weather_mult, weather_reason = get_weather_multiplier(roof_type_raw if not is_forced_outdoor else "Outdoor", w_wind, w_temp, w_precip, p_pos)
+    model_proj = p_mean * get_dynamic_sos(data, stat_col).get(selected_opp, 1.0) * weather_mult
+    win_prob = (1 - poisson.cdf(max(0, market_line - 0.5), model_proj)) * 100 if is_td_market else (1 - norm.cdf(market_line, model_proj, p_std)) * 100
 
-    if is_td_market:
-        win_prob = (1 - poisson.cdf(max(0, market_line - 0.5), model_proj)) * 100
-    else:
-        win_prob = (1 - norm.cdf(market_line, model_proj, p_std)) * 100
-
-    # --- Display ---
     st.title(f"📊 {selected_p} Intelligence Hub")
     c1, c2 = st.columns([2, 1])
     with c1:
         st.metric("Model Projection", f"{round(model_proj, 1)} {selected_market}", f"{round(win_prob, 1)}% Prob > Line")
         last_5 = p_df.tail(5).copy()
         last_5['hit'] = last_5[stat_col] >= market_line
-        fig = go.Figure(go.Bar(x=[f"Wk {w}" for w in last_5['week']], y=last_5[stat_col], 
-                               marker_color=['#00ff96' if h else '#4a4a4a' for h in last_5['hit']]))
+        fig = go.Figure(go.Bar(x=[f"Wk {w}" for w in last_5['week']], y=last_5[stat_col], marker_color=['#00ff96' if h else '#4a4a4a' for h in last_5['hit']]))
         fig.add_hline(y=market_line, line_dash="dash", line_color="#ff4b4b", annotation_text="Line")
         fig.update_layout(title="Last 5 Games vs Current Line", template="plotly_dark", height=300)
         st.plotly_chart(fig, use_container_width=True)
-
     with c2:
         st.subheader("🚀 Smart Parlay Legs")
         parlay_legs = generate_risk_parlay(selected_p, p_pos, p_team, model_proj, p_std, selected_market, data, risk_pref, is_td_market)
-        for leg in parlay_legs:
-            st.info(f"🔹 **{leg['type']}**: {leg['label']}")
+        for leg in parlay_legs: st.info(f"🔹 **{leg['type']}**: {leg['label']}")
         st.write(f"**Weather Adjustment:** {weather_reason}")
