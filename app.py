@@ -14,29 +14,25 @@ API_KEY = "a77014ce7ac884a8102b4aabd0efe1e6"
 # --- NEW: WEATHER IMPACT LOGIC ---
 def get_weather_multiplier(roof_type, wind, temp, precip, p_pos):
     """Calculates a multiplier based on weather severity and stadium type."""
-    # Domes and Closed Roofs negate all weather effects
     if roof_type in ['Dome', 'Closed', 'Indoor']:
         return 1.0, "Dome (No Impact)"
     
     multiplier = 1.0
     impact_reasons = []
 
-    # Wind Impact (Primary factor for QBs/WRs/TEs)
     if wind >= 15:
         if p_pos in ['QB', 'WR', 'TE']:
             penalty = 0.05 if wind < 20 else 0.12
             multiplier -= penalty
             impact_reasons.append(f"High Wind (-{int(penalty*100)}%)")
         elif p_pos == 'RB':
-            multiplier += 0.03  # Slight boost to volume in wind
+            multiplier += 0.03
             impact_reasons.append("Wind Vol. Boost (+3%)")
 
-    # Precipitation Impact
     if precip in ['Rain', 'Snow']:
         multiplier -= 0.05
         impact_reasons.append(f"{precip} (-5%)")
 
-    # Temperature Impact (Extreme Cold)
     if temp <= 20:
         multiplier -= 0.03
         impact_reasons.append("Extreme Cold (-3%)")
@@ -61,24 +57,41 @@ def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, d
     primary_val = round(p_mean + (offset * p_std))
     parlay_legs = [{"label": f"{selected_p}: {max(0, primary_val)}+ {stat_label}", "type": risk_map[risk_level]["label"]}]
     
-    teammates = data[(data['team'] == p_team) & (data['player_name'] != selected_p)]
+    # --- FIXED TEAMMATE SELECTION (PRIORITIZING CURRENT STARTER) ---
+    # Sort by season and week descending to ensure we find the QB playing NOW
+    teammates = data[(data['team'] == p_team) & (data['player_name'] != selected_p)].sort_values(['season', 'week'], ascending=False)
+    
     if not teammates.empty:
+        latest_season = teammates['season'].max()
+        
+        # 1. QB Selected -> Find Top WR/TE based on the latest available data
         if p_pos == 'QB':
-            top_target = teammates[teammates['position'].isin(['WR', 'TE'])].groupby('player_name')['receiving_yards'].sum().idxmax()
-            leg_val = 40 if risk_level == "Conservative (-104)" else 60
-            parlay_legs.append({"label": f"{top_target}: {leg_val}+ Rec Yds", "type": "Teammate Stack"})
-        elif p_pos in ['WR', 'TE']:
-            team_qb_list = teammates[teammates['position'] == 'QB']['player_name'].unique()
-            if len(team_qb_list) > 0:
-                qb_name = team_qb_list[0]
-                leg_val = 215 if risk_level == "Conservative (-104)" else 255
-                parlay_legs.append({"label": f"{qb_name}: {leg_val}+ Pass Yds", "type": "QB Link"})
-        elif p_pos == 'RB':
-            team_qb_list = teammates[teammates['position'] == 'QB']['player_name'].unique()
-            if len(team_qb_list) > 0:
-                qb_name = team_qb_list[0]
-                leg_val = 195 if risk_level == "Conservative (-104)" else 240
-                parlay_legs.append({"label": f"{qb_name}: {leg_val}+ Pass Yds", "type": "Team Success"})
+            seasonal_teammates = teammates[teammates['season'] == latest_season]
+            valid_targets = seasonal_teammates[seasonal_teammates['position'].isin(['WR', 'TE'])]
+            
+            if not valid_targets.empty:
+                top_target = valid_targets.groupby('player_name')['receiving_yards'].sum().idxmax()
+                leg_val = 40 if risk_level == "Conservative (-104)" else 60
+                parlay_legs.append({"label": f"{top_target}: {leg_val}+ Rec Yds", "type": "Teammate Stack"})
+            
+        # 2. WR/TE/RB Selected -> Find CURRENT QB
+        elif p_pos in ['WR', 'TE', 'RB']:
+            current_qbs = teammates[(teammates['position'] == 'QB') & (teammates['season'] == latest_season)]
+            
+            if not current_qbs.empty:
+                # Pick the QB from the most recent game played
+                last_week = current_qbs['week'].max()
+                qb_name = current_qbs[current_qbs['week'] == last_week]['player_name'].iloc[0]
+                
+                if p_pos == 'RB':
+                    leg_val = 195 if risk_level == "Conservative (-104)" else 240
+                    parlay_type = "Team Success"
+                else:
+                    leg_val = 215 if risk_level == "Conservative (-104)" else 255
+                    parlay_type = "QB Link"
+                    
+                parlay_legs.append({"label": f"{qb_name}: {leg_val}+ Pass Yds", "type": parlay_type})
+                
     return parlay_legs
 
 @st.cache_data(ttl=3600)
@@ -124,12 +137,10 @@ if not data.empty:
 
         st.info(f"🤖 **Vegas Pulse:** {v_total} O/U | Spread: {v_spread}")
         
-        # --- VENUE & WEATHER INPUTS ---
         st.divider()
         st.subheader("🌦️ Venue & Weather")
         sel_stad_name = st.selectbox("Game Venue", sorted(stadium_client.get_list_of_stadium_names()))
         
-        # Determine Stadium Roof Status
         stad_obj = stadium_client.get_stadium_by_name(sel_stad_name)
         roof_type = stad_obj.get('roof_type', 'Outdoor') if stad_obj else 'Outdoor'
         
@@ -148,7 +159,6 @@ if not data.empty:
         risk_pref = st.radio("Target Odds Profile", ["Conservative (-104)", "Standard (+105)", "Aggressive (+200)"], index=1)
         game_script = st.select_slider("Expected Flow", options=["Defensive Struggle", "Balanced", "Shootout"], value=auto_script_val)
 
-    # DATA PROCESSING
     p_df = data[data['player_name'] == selected_p].copy()
     if not p_df.empty:
         p_pos = p_df['position'].iloc[-1]
@@ -156,7 +166,6 @@ if not data.empty:
                     'WR': ('receiving_yards', 'receiving_tds', 'Rec Yds'), 'TE': ('receiving_yards', 'receiving_tds', 'Rec Yds')}
         stat_col, td_col, stat_label = stat_map.get(p_pos, ('receiving_yards', 'receiving_tds', 'Yds'))
 
-        # SHARP PROJECTION CALCULATION
         p_mean = p_df[stat_col].mean()
         p_std = p_df[stat_col].std() if len(p_df) > 1 else 1.0
         
@@ -164,26 +173,20 @@ if not data.empty:
         sos_multiplier = dynamic_sos.get(selected_opp, 1.0)
         script_boost = {"Defensive Struggle": 0.90, "Balanced": 1.0, "Shootout": 1.15}[game_script]
         
-        # APPLY WEATHER IMPACT
         weather_multiplier, weather_reason = get_weather_multiplier(roof_type, w_wind, w_temp, w_precip, p_pos)
-        
-        # FINAL MODEL PROJECTION
         model_proj = p_mean * script_boost * sos_multiplier * weather_multiplier
 
-        # UI RENDERING
         st.title(f"📊 {selected_p} Intelligence Hub")
         
         col_main, col_side = st.columns([2, 1])
         
         with col_main:
-            # Weather Impact Badge
             if weather_multiplier != 1.0:
                 st.warning(f"⚠️ **Weather Adjustment:** {weather_reason} (x{weather_multiplier})")
             else:
                 st.caption(f"☀️ **Weather Condition:** {weather_reason}")
 
             st.subheader("🏦 Sportsbook Money Tracker")
-            # Using placeholders for market sentiment based on user sliders in sidebar logic (simplified here)
             fig_money = go.Figure()
             fig_money.add_trace(go.Bar(name='Tickets', x=['Market Sentiment'], y=[65], marker_color='#4a4a4a'))
             fig_money.add_trace(go.Bar(name='Handle', x=['Market Sentiment'], y=[45], marker_color='#00ff96'))
