@@ -74,6 +74,40 @@ def get_weather_multiplier(roof_type, wind, temp, precip, p_pos):
         impact_reasons.append("Extreme Cold (-3%)")
     return round(multiplier, 2), (" + ".join(impact_reasons) if impact_reasons else "Fair Weather")
 
+# --- PARLAY GENERATION LOGIC ---
+def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, data, risk_level, is_td=False):
+    risk_map = {
+        "Conservative (-104)": {"offset": -0.6, "label": "Floor"},
+        "Standard (+105)": {"offset": 0.0, "label": "Mean"},
+        "Aggressive (+200)": {"offset": 0.6, "label": "Ceiling"}
+    }
+    offset = risk_map[risk_level]["offset"]
+    
+    if is_td:
+        primary_val = 0.5 if risk_level != "Aggressive (+200)" else 1.5
+    else:
+        primary_val = max(0, round(p_mean + (offset * p_std)))
+    
+    parlay_legs = [{"label": f"{selected_p}: {primary_val}+ {stat_label}", "type": risk_map[risk_level]["label"]}]
+    
+    # Teammate Correlation Logic
+    teammates = data[(data['team'] == p_team) & (data['player_name'] != selected_p)].sort_values(['season', 'week'], ascending=False)
+    if not teammates.empty:
+        latest_season = teammates['season'].max()
+        if p_pos == 'QB':
+            valid_targets = teammates[(teammates['season'] == latest_season) & (teammates['position'].isin(['WR', 'TE']))]
+            if not valid_targets.empty:
+                top_target = valid_targets.groupby('player_name')['receiving_yards'].sum().idxmax()
+                leg_val = 40 if risk_level == "Conservative (-104)" else 60
+                parlay_legs.append({"label": f"{top_target}: {leg_val}+ Rec Yds", "type": "Teammate Stack"})
+        elif p_pos in ['WR', 'TE', 'RB']:
+            current_qbs = teammates[(teammates['position'] == 'QB') & (teammates['season'] == latest_season)]
+            if not current_qbs.empty:
+                qb_name = current_qbs[current_qbs['week'] == current_qbs['week'].max()]['player_name'].iloc[0]
+                leg_val = 195 if risk_level == "Conservative (-104)" else 240
+                parlay_legs.append({"label": f"{qb_name}: {leg_val}+ Pass Yds", "type": "QB Link"})
+    return parlay_legs
+
 # --- 2. CORE LOGIC & DATA LOADING ---
 @st.cache_data(ttl=3600)
 def load_data_pro():
@@ -100,12 +134,15 @@ if not data.empty:
         selected_opp = st.selectbox("Opponent Defense", sorted(data['opponent'].unique()))
         
         p_df = data[data['player_name'] == selected_p].copy()
+        p_team = p_df['team'].iloc[-1] if not p_df.empty else "N/A"
         p_pos = p_df['position'].iloc[-1] if not p_df.empty else "WR"
 
         selected_market = st.radio("Market Type", ["Yards", "Touchdowns"])
         stat_col = ('passing_yards' if p_pos == 'QB' else 'rushing_yards' if p_pos == 'RB' else 'receiving_yards') if selected_market == "Yards" else ('passing_tds' if p_pos == 'QB' else 'rushing_tds' if p_pos == 'RB' else 'receiving_tds')
         is_td_market = "tds" in stat_col
         market_line = st.number_input("Sportsbook Line", value=0.5 if is_td_market else 50.0, step=0.5)
+        
+        risk_pref = st.radio("Target Odds Profile", ["Conservative (-104)", "Standard (+105)", "Aggressive (+200)"], index=1)
         
         st.subheader("🏟️ Venue & Weather")
         sel_stad_name = st.selectbox("Game Venue", sorted(stadium_client.get_list_of_stadium_names()))
@@ -169,14 +206,21 @@ if not data.empty:
             st.plotly_chart(fig, use_container_width=True)
 
     with c2:
-        st.subheader("🚀 Smart Analysis")
-        st.info(f"🔹 **Weather Adjustment**: {weather_reason}")
+        st.subheader("🚀 Smart Parlay Legs")
         
-        # Simulated Parlay logic (Since generate_risk_parlay was omitted in user snippet, we show context)
-        st.write("**Contextual Factors:**")
-        st.write(f"- Position: {p_pos}")
-        st.write(f"- Venue: {sel_stad_name}")
-        st.write(f"- Modeled Mean: {round(p_mean, 1)}")
+        # Call the parlay generator
+        parlay_legs = generate_risk_parlay(
+            selected_p, p_pos, p_team, model_proj, p_std, 
+            selected_market, data, risk_pref, is_td_market
+        )
+        
+        # Render the legs
+        for leg in parlay_legs:
+            st.info(f"🔹 **{leg['type']}**: {leg['label']}")
+            
+        st.divider()
+        st.subheader("🌦️ Weather Impact")
+        st.write(f"**Factor Summary**: {weather_reason}")
         
         if not is_actually_indoor:
-            st.caption("Outdoor Logic: API Weather Sync active.")
+            st.caption(f"Syncing live weather for outdoor venue: {sel_stad_name}")
