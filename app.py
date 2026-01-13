@@ -157,7 +157,9 @@ if not data.empty:
     model_proj = p_mean * weather_mult # Simplified projection for brevity
     
     st.title(f"📊 {selected_p} Intelligence Hub")
-    st.metric("Model Projection", f"{round(model_proj, 1)} {selected_market}", f"Weather: {weather_reason}")import streamlit as st
+    st.metric("Model Projection", f"{round(model_proj, 1)} {selected_market}", f"Weather: {weather_reason}")
+
+import streamlit as st
 import nflreadpy as nfl
 import pandas as pd
 import numpy as np
@@ -317,3 +319,4 @@ if not data.empty:
     
     st.title(f"📊 {selected_p} Intelligence Hub")
     st.metric("Model Projection", f"{round(model_proj, 1)} {selected_market}", f"Weather: {weather_reason}")
+
