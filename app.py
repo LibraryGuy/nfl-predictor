@@ -22,10 +22,13 @@ if "last_stadium_query" not in st.session_state:
     st.session_state["last_stadium_query"] = ""
 
 # --- STADIUM OVERRIDES ---
+# These venues are strictly open-air and should never be treated as domes.
 FORCE_OUTDOOR = [
     "Gillette Stadium", "Lumen Field", "Hard Rock Stadium", 
     "Acrisure Stadium", "GEHA Field at Arrowhead Stadium",
-    "Highmark Stadium", "Lambeau Field", "Soldier Field"
+    "Highmark Stadium", "Lambeau Field", "Soldier Field",
+    "MetLife Stadium", "Lincoln Financial Field", "Paycor Stadium",
+    "Levi's Stadium", "Empower Field at Mile High", "Bank of America Stadium"
 ]
 
 # --- 2. INTELLIGENT MATCHUP LOGIC ---
@@ -74,6 +77,7 @@ def fetch_stadium_weather(lat, lon, game_time):
 
 # --- WEATHER IMPACT LOGIC ---
 def get_weather_multiplier(roof_type, wind, temp, precip, p_pos):
+    # This check now respects the manual override and logic below
     if any(x in roof_type.lower() for x in ['dome', 'closed', 'indoor']):
         return 1.0, "Dome (No Impact)"
     multiplier, impact_reasons = 1.0, []
@@ -102,7 +106,6 @@ def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, d
     }
     offset = risk_map[risk_level]["offset"]
     
-    # Identify stat column for matchup analysis
     stat_col = ('passing_yards' if p_pos == 'QB' else 'rushing_yards' if p_pos == 'RB' else 'receiving_yards') if not is_td else ('passing_tds' if p_pos == 'QB' else 'receiving_tds')
     m_ratio, m_status = get_matchup_context(data, opponent, p_pos, stat_col)
     
@@ -113,24 +116,20 @@ def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, d
     
     parlay_legs = [{"label": f"{selected_p}: {primary_val}+ {stat_label}", "type": risk_map[risk_level]["label"], "color": "info"}]
     
-    # AVOID LOGIC (Intelligent)
     if is_td:
         prob_zero = poisson.pmf(0, p_mean)
         market_name = "Passing TD" if p_pos == "QB" else "Anytime TD"
         if prob_zero > 0.58 or m_status == "Shutdown":
             parlay_legs.append({
                 "label": f"AVOID: {selected_p} {market_name} (Def vs {p_pos}: {m_status})",
-                "type": "Risk Alert",
-                "color": "error"
+                "type": "Risk Alert", "color": "error"
             })
     elif m_status == "Shutdown" and risk_level == "Aggressive (+200)":
         parlay_legs.append({
             "label": f"AVOID: {selected_p} {stat_label} (Top-Tier Def Matchup)",
-            "type": "Tough Matchup",
-            "color": "error"
+            "type": "Tough Matchup", "color": "error"
         })
 
-    # Teammate Correlation Logic
     teammates = data[(data['team'] == p_team) & (data['player_name'] != selected_p)].sort_values(['season', 'week'], ascending=False)
     if not teammates.empty:
         latest_season = teammates['season'].max()
@@ -190,25 +189,40 @@ if not data.empty and 'player_name' in data.columns:
         st.subheader("🏟️ Venue & Weather")
         sel_stad_name = st.selectbox("Game Venue", sorted(stadium_client.get_list_of_stadium_names()))
         game_time = st.time_input("Kickoff Time", time(13, 0))
+        
         stad_obj = stadium_client.get_stadium_by_name(sel_stad_name)
         roof_type_raw = str(stad_obj.get('roof_type', 'Outdoor'))
-        is_forced_outdoor = any(s in sel_stad_name for s in FORCE_OUTDOOR)
+        
+        # FIX: Check if stadium is in our explicit outdoor list
+        is_forced_outdoor = any(s.lower() in sel_stad_name.lower() for s in FORCE_OUTDOOR)
         is_actually_indoor = any(x in roof_type_raw.lower() for x in ['dome', 'closed', 'indoor']) and not is_forced_outdoor
 
         if is_actually_indoor:
+            st.success(f"🏟️ Indoor: Conditions Controlled")
             w_wind, w_temp, w_precip = 0, 70, "None"
         else:
+            st.info(f"🏟️ Outdoor Venue: Weather Applied")
             lat, lon = (stad_obj.get('latitude'), stad_obj.get('longitude')) if stad_obj else (None, None)
-            if lat and lon:
-                w_temp, w_wind, w_precip = fetch_stadium_weather(lat, lon, game_time)
-            w_temp = st.slider("Temp (F)", -10, 100, value=int(st.session_state.get("w_temp_val", 70)))
-            w_wind = st.slider("Wind (MPH)", 0, 40, value=int(st.session_state.get("w_wind_val", 0)))
-            w_precip = st.selectbox("Precip", ["None", "Rain", "Snow"], index=0)
+            query_key = f"{sel_stad_name}_{game_time.hour}"
+            
+            if st.session_state["last_stadium_query"] != query_key and lat and lon:
+                l_temp, l_wind, l_precip = fetch_stadium_weather(lat, lon, game_time)
+                st.session_state["w_temp_val"] = int(l_temp)
+                st.session_state["w_wind_val"] = int(l_wind)
+                st.session_state["w_precip_val"] = l_precip
+                st.session_state["last_stadium_query"] = query_key
+
+            w_temp = st.slider("Temp (F)", -10, 100, key="w_temp_val")
+            w_wind = st.slider("Wind (MPH)", 0, 40, key="w_wind_val")
+            p_opts = ["None", "Rain", "Snow"]
+            def_p_idx = p_opts.index(st.session_state.get("w_precip_val", "None"))
+            w_precip = st.selectbox("Precip", p_opts, index=def_p_idx)
 
     # CALCULATION
     p_mean = p_df[stat_col].mean()
     p_std = p_df[stat_col].std() if len(p_df) > 1 else (p_mean * 0.4)
-    w_mult, w_reason = get_weather_multiplier(roof_type_raw if not is_forced_outdoor else "Outdoor", w_wind, w_temp, w_precip, p_pos)
+    # Pass corrected roof status
+    w_mult, w_reason = get_weather_multiplier("Indoor" if is_actually_indoor else "Outdoor", w_wind, w_temp, w_precip, p_pos)
     model_proj = p_mean * w_mult
     win_prob = (1 - poisson.cdf(max(0, market_line - 0.5), model_proj)) * 100 if is_td_market else (1 - norm.cdf(market_line, model_proj, p_std)) * 100
 
