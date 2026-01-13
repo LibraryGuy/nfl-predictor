@@ -143,7 +143,6 @@ if not data.empty:
         handle_pct = st.slider("% Sharp Handle (Dollars)", 0, 100, def_handle)
         game_script = st.select_slider("Expected Flow", options=["Defensive Struggle", "Balanced", "Shootout"], value=auto_script_val)
 
-    # --- PERFORMANCE & PROJECTIONS ---
     p_df = data[data['player_name'] == selected_p].copy()
     if not p_df.empty:
         p_pos = p_df['position'].iloc[-1]
@@ -176,7 +175,6 @@ if not data.empty:
                                   title=dict(text=money_msg, font=dict(size=14, color="#00ff96")))
             st.plotly_chart(fig_money, use_container_width=True)
 
-            # Performance Chart (Using the risk-scaled value as the line)
             current_risk_scale = {"Conservative (-104)": 0.65, "Standard (+105)": 0.85, "Aggressive (+200)": 1.05}[risk_pref]
             target_line = round(model_proj * current_risk_scale)
             
@@ -196,15 +194,50 @@ if not data.empty:
             st.table(pd.DataFrame(avg_data))
             
             st.divider()
-            st.subheader(f"🚀 Sharp {risk_pref.split(' ')[0]} Builder")
-            parlay = generate_risk_parlay(selected_p, p_pos, p_team, model_proj, stat_label, data, risk_pref)
+            
+            # --- START UPDATED INTELLIGENCE HUB SECTION ---
+            st.subheader("🎯 Primary Edge")
+            # Logic for Sharp vs Safe recommendation
+            is_sharp = handle_pct > ticket_pct + 5
+            safe_val = round(model_proj * 0.85)
+            
+            if is_sharp:
+                st.success(f"💎 **Sharp Pick:** {selected_p} {safe_val}+ {stat_label}")
+                st.caption("Sharps are backing this floor despite public volume.")
+            else:
+                st.info(f"🟢 **Safe Base:** {selected_p} {safe_val}+ {stat_label}")
 
-            for leg in parlay:
-                st.success(f"✅ **{leg['type']}**: {leg['label']}")
+            st.divider()
+            st.subheader("🚀 Risk-Adjusted Parlays")
             
-            if game_script == "Shootout": 
-                st.warning(f"**Game Flow:** Over {v_total - 1.5} Total Pts")
+            # Display adjusted odds recommendations in Tabs alongside the primary leg
+            t1, t2, t3 = st.tabs(["🛡️ Cons.", "✅ Std.", "🔥 Aggr."])
+            tiers = [
+                (t1, "Conservative (-104)", 0.65),
+                (t2, "Standard (+105)", 0.85),
+                (t3, "Aggressive (+200)", 1.05)
+            ]
             
+            for tab, r_name, scale in tiers:
+                with tab:
+                    parlay_legs = generate_risk_parlay(selected_p, p_pos, p_team, model_proj, stat_label, data, r_name)
+                    for leg in parlay_legs:
+                        st.write(f"🔹 **{leg['type']}**: {leg['label']}")
+                    
+                    # Tier-specific hit rate context
+                    tier_v = round(model_proj * scale)
+                    tier_h = (last_5[stat_col] >= tier_v).sum()
+                    st.caption(f"Historical Hit Rate: {tier_h}/5 Games")
+
+            # Correlated Betting Add-ons
+            if last_5[td_col].mean() >= 0.6 or game_script == "Shootout":
+                st.divider()
+                st.subheader("🔗 Correlated Add-ons")
+                if last_5[td_col].mean() >= 0.6: 
+                    st.write(f"🏈 **Value TD:** {selected_p} Anytime TD")
+                if game_script == "Shootout": 
+                    st.write(f"📈 **Game Script:** Over {v_total - 1.5} Total Pts")
+
             st.divider()
             hit_count = last_5['hit'].sum()
             st.write(f"**Consistency ({risk_pref.split(' ')[0]}):** {hit_count}/5 Games Hit")
