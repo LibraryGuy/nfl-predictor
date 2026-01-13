@@ -22,7 +22,6 @@ if "last_stadium_query" not in st.session_state:
     st.session_state["last_stadium_query"] = ""
 
 # --- STADIUM OVERRIDES ---
-# These venues are often mislabeled as domes/indoor due to partial roofs or recent renovations
 FORCE_OUTDOOR = [
     "Gillette Stadium", "Lumen Field", "Hard Rock Stadium", 
     "Acrisure Stadium", "GEHA Field at Arrowhead Stadium",
@@ -42,29 +41,22 @@ def fetch_stadium_weather(lat, lon, game_time):
         response = requests.get(url, params=params, timeout=5).json()
         hourly = response.get('hourly', {})
         times = hourly.get('time', [])
-        
-        # Match current hour (today's date)
         target_str = datetime.now().strftime(f"%Y-%m-%dT{game_time.strftime('%H')}:00")
         idx = times.index(target_str) if target_str in times else 0
-        
         temp = hourly.get('temperature_2m', [70])[idx]
         wind = hourly.get('wind_speed_10m', [0])[idx]
         precip_val = hourly.get('precipitation', [0])[idx]
-        
         precip_type = "None"
         if precip_val > 0.1: precip_type = "Rain"
         if temp < 32 and precip_val > 0: precip_type = "Snow"
-        
         return temp, wind, precip_type
     except Exception:
         return 70, 0, "None"
 
 # --- WEATHER IMPACT LOGIC ---
 def get_weather_multiplier(roof_type, wind, temp, precip, p_pos):
-    # Check for actual domes or closed retractable roofs
     if any(x in roof_type.lower() for x in ['dome', 'closed', 'indoor']):
         return 1.0, "Dome (No Impact)"
-    
     multiplier, impact_reasons = 1.0, []
     if wind >= 15:
         penalty = 0.05 if wind < 20 else 0.12
@@ -113,18 +105,14 @@ if not data.empty:
         selected_market = st.radio("Market Type", ["Yards", "Touchdowns"])
         stat_col = ('passing_yards' if p_pos == 'QB' else 'rushing_yards' if p_pos == 'RB' else 'receiving_yards') if selected_market == "Yards" else ('passing_tds' if p_pos == 'QB' else 'rushing_tds' if p_pos == 'RB' else 'receiving_tds')
         is_td_market = "tds" in stat_col
-
         market_line = st.number_input("Sportsbook Line", value=0.5 if is_td_market else 50.0, step=0.5)
         
-        # --- ROBUST WEATHER UI ---
         st.subheader("🏟️ Venue & Weather")
         sel_stad_name = st.selectbox("Game Venue", sorted(stadium_client.get_list_of_stadium_names()))
         game_time = st.time_input("Kickoff Time (Local)", time(13, 0))
         
         stad_obj = stadium_client.get_stadium_by_name(sel_stad_name)
         roof_type_raw = str(stad_obj.get('roof_type', 'Outdoor'))
-        
-        # Override check
         is_forced_outdoor = any(s in sel_stad_name for s in FORCE_OUTDOOR)
         is_actually_indoor = any(x in roof_type_raw.lower() for x in ['dome', 'closed', 'indoor']) and not is_forced_outdoor
 
@@ -134,10 +122,8 @@ if not data.empty:
         else:
             lat, lon = (stad_obj.get('latitude'), stad_obj.get('longitude')) if stad_obj else (None, None)
             query_key = f"{sel_stad_name}_{game_time.hour}"
-            
-            # Fetch new weather if stadium or time changed
             if st.session_state["last_stadium_query"] != query_key and lat and lon:
-                with st.spinner(f"Fetching Live Forecast for {sel_stad_name}..."):
+                with st.spinner(f"Fetching Live Forecast..."):
                     l_temp, l_wind, l_precip = fetch_stadium_weather(lat, lon, game_time)
                     st.session_state["w_temp_val"] = int(l_temp)
                     st.session_state["w_wind_val"] = int(l_wind)
@@ -150,11 +136,47 @@ if not data.empty:
             def_p_idx = p_opts.index(st.session_state.get("w_precip_val", "None"))
             w_precip = st.selectbox("Precipitation", p_opts, index=def_p_idx)
 
-    # --- Calculation Logic ---
+    # --- CALCULATION LOGIC ---
     p_mean = p_df[stat_col].mean()
     p_std = p_df[stat_col].std() if len(p_df) > 1 else (p_mean * 0.4)
     weather_mult, weather_reason = get_weather_multiplier(roof_type_raw if not is_forced_outdoor else "Outdoor", w_wind, w_temp, w_precip, p_pos)
-    model_proj = p_mean * weather_mult # Simplified projection for brevity
-    
+    model_proj = p_mean * weather_mult
+    win_prob = (1 - poisson.cdf(max(0, market_line - 0.5), model_proj)) * 100 if is_td_market else (1 - norm.cdf(market_line, model_proj, p_std)) * 100
+
+    # --- DASHBOARD STRUCTURAL ALIGNMENT ---
     st.title(f"📊 {selected_p} Intelligence Hub")
-    st.metric("Model Projection", f"{round(model_proj, 1)} {selected_market}", f"Weather: {weather_reason}")
+    
+    c1, c2 = st.columns([2, 1])
+    
+    with c1:
+        st.metric(
+            label="Model Projection", 
+            value=f"{round(model_proj, 1)} {selected_market}", 
+            delta=f"Prob > Line: {round(win_prob, 1)}%"
+        )
+        
+        # Historical Performance Chart
+        if not p_df.empty:
+            last_5 = p_df.tail(5).copy()
+            last_5['hit'] = last_5[stat_col] >= market_line
+            fig = go.Figure(go.Bar(
+                x=[f"Wk {w}" for w in last_5['week']], 
+                y=last_5[stat_col], 
+                marker_color=['#00ff96' if h else '#4a4a4a' for h in last_5['hit']]
+            ))
+            fig.add_hline(y=market_line, line_dash="dash", line_color="#ff4b4b", annotation_text="Line")
+            fig.update_layout(title="Last 5 Games vs Current Line", template="plotly_dark", height=300)
+            st.plotly_chart(fig, use_container_width=True)
+
+    with c2:
+        st.subheader("🚀 Smart Analysis")
+        st.info(f"🔹 **Weather Adjustment**: {weather_reason}")
+        
+        # Simulated Parlay logic (Since generate_risk_parlay was omitted in user snippet, we show context)
+        st.write("**Contextual Factors:**")
+        st.write(f"- Position: {p_pos}")
+        st.write(f"- Venue: {sel_stad_name}")
+        st.write(f"- Modeled Mean: {round(p_mean, 1)}")
+        
+        if not is_actually_indoor:
+            st.caption("Outdoor Logic: API Weather Sync active.")
