@@ -22,7 +22,6 @@ if "last_stadium_query" not in st.session_state:
     st.session_state["last_stadium_query"] = ""
 
 # --- STADIUM OVERRIDES ---
-# These venues are strictly open-air and should never be treated as domes.
 FORCE_OUTDOOR = [
     "Gillette Stadium", "Lumen Field", "Hard Rock Stadium", 
     "Acrisure Stadium", "GEHA Field at Arrowhead Stadium",
@@ -33,7 +32,6 @@ FORCE_OUTDOOR = [
 
 # --- 2. INTELLIGENT MATCHUP LOGIC ---
 def get_matchup_context(data, opponent, p_pos, stat_col):
-    """Analyses if a defense shuts down specific positions."""
     opp_def_stats = data[(data['opponent'] == opponent) & (data['position'] == p_pos)]
     if opp_def_stats.empty:
         return 1.0, "Neutral"
@@ -41,9 +39,7 @@ def get_matchup_context(data, opponent, p_pos, stat_col):
     league_avg = data[data['position'] == p_pos][stat_col].mean()
     opp_avg = opp_def_stats[stat_col].mean()
     
-    # Ratio: < 0.85 means defense is elite (shuts down), > 1.15 means vulnerable
     m_ratio = opp_avg / league_avg if league_avg > 0 else 1.0
-    
     status = "Neutral"
     if m_ratio < 0.85: status = "Shutdown"
     elif m_ratio > 1.15: status = "Vulnerable"
@@ -77,7 +73,6 @@ def fetch_stadium_weather(lat, lon, game_time):
 
 # --- WEATHER IMPACT LOGIC ---
 def get_weather_multiplier(roof_type, wind, temp, precip, p_pos):
-    # This check now respects the manual override and logic below
     if any(x in roof_type.lower() for x in ['dome', 'closed', 'indoor']):
         return 1.0, "Dome (No Impact)"
     multiplier, impact_reasons = 1.0, []
@@ -96,6 +91,21 @@ def get_weather_multiplier(roof_type, wind, temp, precip, p_pos):
         multiplier -= 0.03
         impact_reasons.append("Extreme Cold (-3%)")
     return round(multiplier, 2), (" + ".join(impact_reasons) if impact_reasons else "Fair Weather")
+
+# --- 3. MONTE CARLO ENGINE ---
+def run_monte_carlo(mean_val, std_val, is_td, iterations=10000):
+    """Generates 10,000 possible game outcomes."""
+    if mean_val <= 0: return np.zeros(iterations)
+    
+    if is_td:
+        # Simulations for discrete events (TDs)
+        return np.random.poisson(mean_val, iterations)
+    else:
+        # Yardage simulation using Log-Normal distribution
+        # This handles the skewness of NFL big plays better than Normal dist
+        sigma = np.sqrt(np.log(1 + (std_val**2 / mean_val**2)))
+        mu = np.log(mean_val) - (sigma**2 / 2)
+        return np.random.lognormal(mu, sigma, iterations)
 
 # --- PARLAY GENERATION LOGIC ---
 def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, data, risk_level, is_td, opponent):
@@ -147,7 +157,7 @@ def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, d
                 parlay_legs.append({"label": f"{qb_name}: {leg_val}+ Pass Yds", "type": "QB Link", "color": "info"})
     return parlay_legs
 
-# --- 3. DATA LOADING ---
+# --- 4. DATA LOADING ---
 @st.cache_data(ttl=3600)
 def load_data_pro():
     try:
@@ -168,7 +178,7 @@ raw_data = load_data_pro()
 data = raw_data if isinstance(raw_data, pd.DataFrame) else pd.DataFrame()
 stadium_client = NFLStadiums()
 
-# --- 4. UI RENDERING ---
+# --- 5. UI RENDERING ---
 if not data.empty and 'player_name' in data.columns:
     with st.sidebar:
         st.header("🎯 Target Selection")
@@ -192,8 +202,6 @@ if not data.empty and 'player_name' in data.columns:
         
         stad_obj = stadium_client.get_stadium_by_name(sel_stad_name)
         roof_type_raw = str(stad_obj.get('roof_type', 'Outdoor'))
-        
-        # FIX: Check if stadium is in our explicit outdoor list
         is_forced_outdoor = any(s.lower() in sel_stad_name.lower() for s in FORCE_OUTDOOR)
         is_actually_indoor = any(x in roof_type_raw.lower() for x in ['dome', 'closed', 'indoor']) and not is_forced_outdoor
 
@@ -204,44 +212,63 @@ if not data.empty and 'player_name' in data.columns:
             st.info(f"🏟️ Outdoor Venue: Weather Applied")
             lat, lon = (stad_obj.get('latitude'), stad_obj.get('longitude')) if stad_obj else (None, None)
             query_key = f"{sel_stad_name}_{game_time.hour}"
-            
             if st.session_state["last_stadium_query"] != query_key and lat and lon:
                 l_temp, l_wind, l_precip = fetch_stadium_weather(lat, lon, game_time)
                 st.session_state["w_temp_val"] = int(l_temp)
                 st.session_state["w_wind_val"] = int(l_wind)
                 st.session_state["w_precip_val"] = l_precip
                 st.session_state["last_stadium_query"] = query_key
-
             w_temp = st.slider("Temp (F)", -10, 100, key="w_temp_val")
             w_wind = st.slider("Wind (MPH)", 0, 40, key="w_wind_val")
             p_opts = ["None", "Rain", "Snow"]
             def_p_idx = p_opts.index(st.session_state.get("w_precip_val", "None"))
             w_precip = st.selectbox("Precip", p_opts, index=def_p_idx)
 
-    # CALCULATION
+    # --- CALCULATION (MONTE CARLO INTEGRATED) ---
     p_mean = p_df[stat_col].mean()
     p_std = p_df[stat_col].std() if len(p_df) > 1 else (p_mean * 0.4)
-    # Pass corrected roof status
     w_mult, w_reason = get_weather_multiplier("Indoor" if is_actually_indoor else "Outdoor", w_wind, w_temp, w_precip, p_pos)
-    model_proj = p_mean * w_mult
-    win_prob = (1 - poisson.cdf(max(0, market_line - 0.5), model_proj)) * 100 if is_td_market else (1 - norm.cdf(market_line, model_proj, p_std)) * 100
+    m_ratio, m_status = get_matchup_context(data, selected_opp, p_pos, stat_col)
+    
+    # Final adjusted mean used for simulation
+    sim_mean = p_mean * w_mult * m_ratio
+    
+    # Run Simulation
+    sim_results = run_monte_carlo(sim_mean, p_std, is_td_market)
+    
+    # Calculate Win Probability based on Sims
+    win_count = np.sum(sim_results >= market_line)
+    win_prob = (win_count / 10000) * 100
 
-    # DASHBOARD
+    # --- DASHBOARD ---
     st.title(f"📊 {selected_p} Intelligence Hub")
     c1, c2 = st.columns([2, 1])
     
     with c1:
-        st.metric("Model Projection", f"{round(model_proj, 1)} {selected_market}", f"Win Prob: {round(win_prob, 1)}%")
-        if not p_df.empty:
-            last_5 = p_df.tail(5).copy()
-            fig = go.Figure(go.Bar(x=[f"Wk {w}" for w in last_5['week']], y=last_5[stat_col], marker_color='#00ff96'))
-            fig.add_hline(y=market_line, line_dash="dash", line_color="#ff4b4b")
-            fig.update_layout(title="Recent Performance", template="plotly_dark", height=300)
-            st.plotly_chart(fig, use_container_width=True)
+        st.metric("Model Projection", f"{round(sim_mean, 1)} {selected_market}", f"Win Prob: {round(win_prob, 1)}% (via 10k Sims)")
+        
+        # PROBABILITY DISTRIBUTION CHART
+        fig_dist = go.Figure()
+        fig_dist.add_trace(go.Histogram(
+            x=sim_results, 
+            nbinsx=50, 
+            name="Simulated Outcomes", 
+            marker_color='#00ff96',
+            opacity=0.75
+        ))
+        fig_dist.add_vline(x=market_line, line_dash="dash", line_color="#ff4b4b", annotation_text="Sportsbook Line")
+        fig_dist.update_layout(
+            title=f"Probability Distribution: {selected_market}",
+            xaxis_title=selected_market,
+            yaxis_title="Frequency (Out of 10,000 Games)",
+            template="plotly_dark", 
+            height=350
+        )
+        st.plotly_chart(fig_dist, use_container_width=True)
 
     with c2:
         st.subheader("🚀 Smart Parlay Legs")
-        parlay_legs = generate_risk_parlay(selected_p, p_pos, p_team, model_proj, p_std, selected_market, data, risk_pref, is_td_market, selected_opp)
+        parlay_legs = generate_risk_parlay(selected_p, p_pos, p_team, sim_mean, p_std, selected_market, data, risk_pref, is_td_market, selected_opp)
         for leg in parlay_legs:
             if leg.get('color') == "error":
                 st.error(f"⚠️ {leg['label']}")
@@ -251,5 +278,6 @@ if not data.empty and 'player_name' in data.columns:
         st.divider()
         st.subheader("🌦️ Weather Impact")
         st.write(f"**Factor Summary**: {w_reason}")
+        st.write(f"**Matchup Adjustment**: {m_status} ({m_ratio}x)")
 else:
     st.warning("⚠️ Data Initialization Error.")
