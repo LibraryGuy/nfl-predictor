@@ -11,32 +11,32 @@ from nfl_stadiums import NFLStadiums
 # --- 1. SETTINGS & API CONFIG ---
 st.set_page_config(page_title="NFL Sharp: Intelligence Hub", layout="wide", page_icon="🏈")
 
-# --- NEW: AUTOMATED WEATHER FETCH ---
+# --- INITIALIZE SESSION STATE KEYS ---
+if "w_temp_val" not in st.session_state:
+    st.session_state["w_temp_val"] = 70
+if "w_wind_val" not in st.session_state:
+    st.session_state["w_wind_val"] = 0
+if "w_precip_val" not in st.session_state:
+    st.session_state["w_precip_val"] = "None"
+if "last_stadium_query" not in st.session_state:
+    st.session_state["last_stadium_query"] = ""
+
+# --- AUTOMATED WEATHER FETCH ---
 def fetch_stadium_weather(lat, lon, game_time):
-    """Fetches hourly weather forecast from Open-Meteo based on stadium coordinates."""
     try:
         url = "https://api.open-meteo.com/v1/forecast"
         params = {
-            "latitude": lat,
-            "longitude": lon,
+            "latitude": lat, "longitude": lon,
             "hourly": ["temperature_2m", "precipitation", "wind_speed_10m"],
-            "temperature_unit": "fahrenheit",
-            "wind_speed_unit": "mph",
-            "timezone": "auto",
-            "forecast_days": 7
+            "temperature_unit": "fahrenheit", "wind_speed_unit": "mph",
+            "timezone": "auto", "forecast_days": 7
         }
         response = requests.get(url, params=params, timeout=5).json()
         hourly = response.get('hourly', {})
         times = hourly.get('time', [])
-        
-        # Find the index for the selected game hour (today's date assumed for simplicity)
         target_str = datetime.now().strftime(f"%Y-%m-%dT{game_time.strftime('%H')}:00")
         
-        # Default fallback values
-        idx = 0
-        if target_str in times:
-            idx = times.index(target_str)
-            
+        idx = times.index(target_str) if target_str in times else 0
         temp = hourly.get('temperature_2m', [70])[idx]
         wind = hourly.get('wind_speed_10m', [0])[idx]
         precip_val = hourly.get('precipitation', [0])[idx]
@@ -47,7 +47,7 @@ def fetch_stadium_weather(lat, lon, game_time):
         
         return temp, wind, precip_type
     except Exception:
-        return 70, 0, "None" # Fallback to fair weather
+        return 70, 0, "None"
 
 # --- WEATHER IMPACT LOGIC ---
 def get_weather_multiplier(roof_type, wind, temp, precip, p_pos):
@@ -70,7 +70,7 @@ def get_weather_multiplier(roof_type, wind, temp, precip, p_pos):
         impact_reasons.append("Extreme Cold (-3%)")
     return round(multiplier, 2), (" + ".join(impact_reasons) if impact_reasons else "Fair Weather")
 
-# --- 2. CORE LOGIC ---
+# --- CORE LOGIC ---
 def get_dynamic_sos(data, stat_col):
     if data.empty: return {}
     league_avg = data[stat_col].mean()
@@ -149,10 +149,10 @@ if not data.empty:
         market_line = st.number_input("Sportsbook Line", value=0.5 if is_td_market else 50.0, step=0.5)
         risk_pref = st.radio("Target Odds Profile", ["Conservative (-104)", "Standard (+105)", "Aggressive (+200)"], index=1)
         
-        # Stadium & Weather logic
-        st.subheader("🏟️ Venue & Game Time")
+        # --- FIXED WEATHER LOGIC ---
+        st.subheader("🏟️ Venue & Weather")
         sel_stad_name = st.selectbox("Game Venue", sorted(stadium_client.get_list_of_stadium_names()))
-        game_time = st.time_input("Scheduled Kickoff (Local Time)", time(13, 0)) # Default 1 PM
+        game_time = st.time_input("Kickoff Time (Local)", time(13, 0))
         
         stad_obj = stadium_client.get_stadium_by_name(sel_stad_name)
         roof_type = stad_obj.get('roof_type', 'Outdoor') if stad_obj else 'Outdoor'
@@ -162,23 +162,28 @@ if not data.empty:
             st.success(f"Dome: Conditions Controlled")
             w_wind, w_temp, w_precip = 0, 70, "None"
         else:
-            # Automatic fetch if outdoor
-            if lat and lon:
+            # Check if we need to fetch new data (triggers on stadium or time change)
+            query_key = f"{sel_stad_name}_{game_time.hour}"
+            if st.session_state["last_stadium_query"] != query_key and lat and lon:
                 with st.spinner("Fetching Live Forecast..."):
-                    live_temp, live_wind, live_precip = fetch_stadium_weather(lat, lon, game_time)
-                w_temp = st.slider("Temperature (F)", -10, 100, int(live_temp))
-                w_wind = st.slider("Wind Speed (MPH)", 0, 40, int(live_wind))
-                p_opts = ["None", "Rain", "Snow"]
-                w_precip = st.selectbox("Precipitation", p_opts, index=p_opts.index(live_precip))
-            else:
-                w_wind = st.slider("Wind Speed (MPH)", 0, 40, 5)
-                w_temp = st.slider("Temperature (F)", -10, 100, 55)
-                w_precip = st.selectbox("Precipitation", ["None", "Rain", "Snow"])
+                    l_temp, l_wind, l_precip = fetch_stadium_weather(lat, lon, game_time)
+                    # Update session state values
+                    st.session_state["w_temp_val"] = int(l_temp)
+                    st.session_state["w_wind_val"] = int(l_wind)
+                    st.session_state["w_precip_val"] = l_precip
+                    st.session_state["last_stadium_query"] = query_key
+
+            # Render sliders tied to session state
+            w_temp = st.slider("Temperature (F)", -10, 100, key="w_temp_val")
+            w_wind = st.slider("Wind Speed (MPH)", 0, 40, key="w_wind_val")
+            p_opts = ["None", "Rain", "Snow"]
+            # Map precip to selection box index
+            def_p_idx = p_opts.index(st.session_state.get("w_precip_val", "None"))
+            w_precip = st.selectbox("Precipitation", p_opts, index=def_p_idx)
 
     # --- Calculations ---
     p_mean = p_df[stat_col].mean()
     p_std = p_df[stat_col].std() if len(p_df) > 1 else (p_mean * 0.4)
-    
     weather_mult, weather_reason = get_weather_multiplier(roof_type, w_wind, w_temp, w_precip, p_pos)
     sos_mult = get_dynamic_sos(data, stat_col).get(selected_opp, 1.0)
     model_proj = p_mean * sos_mult * weather_mult
@@ -191,7 +196,6 @@ if not data.empty:
     # --- Display ---
     st.title(f"📊 {selected_p} Intelligence Hub")
     c1, c2 = st.columns([2, 1])
-    
     with c1:
         st.metric("Model Projection", f"{round(model_proj, 1)} {selected_market}", f"{round(win_prob, 1)}% Prob > Line")
         last_5 = p_df.tail(5).copy()
