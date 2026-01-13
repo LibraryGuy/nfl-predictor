@@ -28,6 +28,25 @@ FORCE_OUTDOOR = [
     "Highmark Stadium", "Lambeau Field", "Soldier Field"
 ]
 
+# --- 2. INTELLIGENT MATCHUP LOGIC ---
+def get_matchup_context(data, opponent, p_pos, stat_col):
+    """Analyses if a defense shuts down specific positions."""
+    opp_def_stats = data[(data['opponent'] == opponent) & (data['position'] == p_pos)]
+    if opp_def_stats.empty:
+        return 1.0, "Neutral"
+    
+    league_avg = data[data['position'] == p_pos][stat_col].mean()
+    opp_avg = opp_def_stats[stat_col].mean()
+    
+    # Ratio: < 0.85 means defense is elite (shuts down), > 1.15 means vulnerable
+    m_ratio = opp_avg / league_avg if league_avg > 0 else 1.0
+    
+    status = "Neutral"
+    if m_ratio < 0.85: status = "Shutdown"
+    elif m_ratio > 1.15: status = "Vulnerable"
+    
+    return round(m_ratio, 2), status
+
 # --- AUTOMATED WEATHER FETCH ---
 def fetch_stadium_weather(lat, lon, game_time):
     try:
@@ -75,7 +94,7 @@ def get_weather_multiplier(roof_type, wind, temp, precip, p_pos):
     return round(multiplier, 2), (" + ".join(impact_reasons) if impact_reasons else "Fair Weather")
 
 # --- PARLAY GENERATION LOGIC ---
-def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, data, risk_level, is_td=False):
+def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, data, risk_level, is_td, opponent):
     risk_map = {
         "Conservative (-104)": {"offset": -0.6, "label": "Floor"},
         "Standard (+105)": {"offset": 0.0, "label": "Mean"},
@@ -83,13 +102,34 @@ def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, d
     }
     offset = risk_map[risk_level]["offset"]
     
+    # Identify stat column for matchup analysis
+    stat_col = ('passing_yards' if p_pos == 'QB' else 'rushing_yards' if p_pos == 'RB' else 'receiving_yards') if not is_td else ('passing_tds' if p_pos == 'QB' else 'receiving_tds')
+    m_ratio, m_status = get_matchup_context(data, opponent, p_pos, stat_col)
+    
     if is_td:
         primary_val = 0.5 if risk_level != "Aggressive (+200)" else 1.5
     else:
         primary_val = max(0, round(p_mean + (offset * p_std)))
     
-    parlay_legs = [{"label": f"{selected_p}: {primary_val}+ {stat_label}", "type": risk_map[risk_level]["label"]}]
+    parlay_legs = [{"label": f"{selected_p}: {primary_val}+ {stat_label}", "type": risk_map[risk_level]["label"], "color": "info"}]
     
+    # AVOID LOGIC (Intelligent)
+    if is_td:
+        prob_zero = poisson.pmf(0, p_mean)
+        market_name = "Passing TD" if p_pos == "QB" else "Anytime TD"
+        if prob_zero > 0.58 or m_status == "Shutdown":
+            parlay_legs.append({
+                "label": f"AVOID: {selected_p} {market_name} (Def vs {p_pos}: {m_status})",
+                "type": "Risk Alert",
+                "color": "error"
+            })
+    elif m_status == "Shutdown" and risk_level == "Aggressive (+200)":
+        parlay_legs.append({
+            "label": f"AVOID: {selected_p} {stat_label} (Top-Tier Def Matchup)",
+            "type": "Tough Matchup",
+            "color": "error"
+        })
+
     # Teammate Correlation Logic
     teammates = data[(data['team'] == p_team) & (data['player_name'] != selected_p)].sort_values(['season', 'week'], ascending=False)
     if not teammates.empty:
@@ -99,39 +139,27 @@ def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, d
             if not valid_targets.empty:
                 top_target = valid_targets.groupby('player_name')['receiving_yards'].sum().idxmax()
                 leg_val = 40 if risk_level == "Conservative (-104)" else 60
-                parlay_legs.append({"label": f"{top_target}: {leg_val}+ Rec Yds", "type": "Teammate Stack"})
+                parlay_legs.append({"label": f"{top_target}: {leg_val}+ Rec Yds", "type": "Teammate Stack", "color": "info"})
         elif p_pos in ['WR', 'TE', 'RB']:
             current_qbs = teammates[(teammates['position'] == 'QB') & (teammates['season'] == latest_season)]
             if not current_qbs.empty:
                 qb_name = current_qbs[current_qbs['week'] == current_qbs['week'].max()]['player_name'].iloc[0]
                 leg_val = 195 if risk_level == "Conservative (-104)" else 240
-                parlay_legs.append({"label": f"{qb_name}: {leg_val}+ Pass Yds", "type": "QB Link"})
+                parlay_legs.append({"label": f"{qb_name}: {leg_val}+ Pass Yds", "type": "QB Link", "color": "info"})
     return parlay_legs
 
-# --- 2. CORE LOGIC & DATA LOADING ---
+# --- 3. DATA LOADING ---
 @st.cache_data(ttl=3600)
 def load_data_pro():
     try:
         df = nfl.load_player_stats(seasons=[2024, 2025]).to_pandas()
-        
-        # Robust renaming strategy for varied schemas
-        rename_map = {
-            'player_display_name': 'player_name', 
-            'recent_team': 'team', 
-            'opponent_team': 'opponent'
-        }
+        rename_map = {'player_display_name': 'player_name', 'recent_team': 'team', 'opponent_team': 'opponent'}
         df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
-        
-        # Fallback for player_name
         if 'player_name' not in df.columns and 'player' in df.columns:
             df = df.rename(columns={'player': 'player_name'})
-
         df = df.loc[:, ~df.columns.duplicated()].copy()
         for col in ['passing_yards', 'rushing_yards', 'receiving_yards', 'receptions', 'passing_tds', 'rushing_tds', 'receiving_tds']:
-            if col in df.columns:
-                df[col] = df[col].fillna(0)
-            else:
-                df[col] = 0
+            df[col] = df.get(col, 0).fillna(0)
         return df.dropna(subset=['player_name'])
     except Exception as e:
         st.error(f"Sync Failure: {e}")
@@ -141,101 +169,73 @@ raw_data = load_data_pro()
 data = raw_data if isinstance(raw_data, pd.DataFrame) else pd.DataFrame()
 stadium_client = NFLStadiums()
 
-# --- 3. UI RENDERING ---
-# SAFETY CHECK: Only render if 'player_name' was successfully mapped
+# --- 4. UI RENDERING ---
 if not data.empty and 'player_name' in data.columns:
     with st.sidebar:
         st.header("🎯 Target Selection")
         selected_p = st.selectbox("Select Player", sorted(data['player_name'].unique()))
-        
-        # Filter defenses only if the column exists
         opp_list = sorted(data['opponent'].unique()) if 'opponent' in data.columns else ["N/A"]
         selected_opp = st.selectbox("Opponent Defense", opp_list)
         
         p_df = data[data['player_name'] == selected_p].copy()
-        p_team = p_df['team'].iloc[-1] if 'team' in p_df.columns and not p_df.empty else "N/A"
-        p_pos = p_df['position'].iloc[-1] if 'position' in p_df.columns and not p_df.empty else "WR"
+        p_team = p_df['team'].iloc[-1] if not p_df.empty else "N/A"
+        p_pos = p_df['position'].iloc[-1] if not p_df.empty else "WR"
 
         selected_market = st.radio("Market Type", ["Yards", "Touchdowns"])
         stat_col = ('passing_yards' if p_pos == 'QB' else 'rushing_yards' if p_pos == 'RB' else 'receiving_yards') if selected_market == "Yards" else ('passing_tds' if p_pos == 'QB' else 'rushing_tds' if p_pos == 'RB' else 'receiving_tds')
         is_td_market = "tds" in stat_col
         market_line = st.number_input("Sportsbook Line", value=0.5 if is_td_market else 50.0, step=0.5)
-        
         risk_pref = st.radio("Target Odds Profile", ["Conservative (-104)", "Standard (+105)", "Aggressive (+200)"], index=1)
         
         st.subheader("🏟️ Venue & Weather")
         sel_stad_name = st.selectbox("Game Venue", sorted(stadium_client.get_list_of_stadium_names()))
-        game_time = st.time_input("Kickoff Time (Local)", time(13, 0))
-        
+        game_time = st.time_input("Kickoff Time", time(13, 0))
         stad_obj = stadium_client.get_stadium_by_name(sel_stad_name)
         roof_type_raw = str(stad_obj.get('roof_type', 'Outdoor'))
         is_forced_outdoor = any(s in sel_stad_name for s in FORCE_OUTDOOR)
         is_actually_indoor = any(x in roof_type_raw.lower() for x in ['dome', 'closed', 'indoor']) and not is_forced_outdoor
 
         if is_actually_indoor:
-            st.success(f"🏟️ Indoor: Conditions Controlled")
             w_wind, w_temp, w_precip = 0, 70, "None"
         else:
             lat, lon = (stad_obj.get('latitude'), stad_obj.get('longitude')) if stad_obj else (None, None)
-            query_key = f"{sel_stad_name}_{game_time.hour}"
-            if st.session_state["last_stadium_query"] != query_key and lat and lon:
-                with st.spinner(f"Fetching Live Forecast..."):
-                    l_temp, l_wind, l_precip = fetch_stadium_weather(lat, lon, game_time)
-                    st.session_state["w_temp_val"] = int(l_temp)
-                    st.session_state["w_wind_val"] = int(l_wind)
-                    st.session_state["w_precip_val"] = l_precip
-                    st.session_state["last_stadium_query"] = query_key
+            if lat and lon:
+                w_temp, w_wind, w_precip = fetch_stadium_weather(lat, lon, game_time)
+            w_temp = st.slider("Temp (F)", -10, 100, value=int(st.session_state.get("w_temp_val", 70)))
+            w_wind = st.slider("Wind (MPH)", 0, 40, value=int(st.session_state.get("w_wind_val", 0)))
+            w_precip = st.selectbox("Precip", ["None", "Rain", "Snow"], index=0)
 
-            w_temp = st.slider("Temperature (F)", -10, 100, key="w_temp_val")
-            w_wind = st.slider("Wind Speed (MPH)", 0, 40, key="w_wind_val")
-            p_opts = ["None", "Rain", "Snow"]
-            def_p_idx = p_opts.index(st.session_state.get("w_precip_val", "None"))
-            w_precip = st.selectbox("Precipitation", p_opts, index=def_p_idx)
-
-    # --- CALCULATION LOGIC ---
+    # CALCULATION
     p_mean = p_df[stat_col].mean()
     p_std = p_df[stat_col].std() if len(p_df) > 1 else (p_mean * 0.4)
-    weather_mult, weather_reason = get_weather_multiplier(roof_type_raw if not is_forced_outdoor else "Outdoor", w_wind, w_temp, w_precip, p_pos)
-    model_proj = p_mean * weather_mult
+    w_mult, w_reason = get_weather_multiplier(roof_type_raw if not is_forced_outdoor else "Outdoor", w_wind, w_temp, w_precip, p_pos)
+    model_proj = p_mean * w_mult
     win_prob = (1 - poisson.cdf(max(0, market_line - 0.5), model_proj)) * 100 if is_td_market else (1 - norm.cdf(market_line, model_proj, p_std)) * 100
 
-    # --- DASHBOARD STRUCTURAL ALIGNMENT ---
+    # DASHBOARD
     st.title(f"📊 {selected_p} Intelligence Hub")
-    
     c1, c2 = st.columns([2, 1])
     
     with c1:
-        st.metric(
-            label="Model Projection", 
-            value=f"{round(model_proj, 1)} {selected_market}", 
-            delta=f"Prob > Line: {round(win_prob, 1)}%"
-        )
-        
+        st.metric("Model Projection", f"{round(model_proj, 1)} {selected_market}", f"Win Prob: {round(win_prob, 1)}%")
         if not p_df.empty:
             last_5 = p_df.tail(5).copy()
-            last_5['hit'] = last_5[stat_col] >= market_line
-            fig = go.Figure(go.Bar(
-                x=[f"Wk {w}" for w in last_5['week']], 
-                y=last_5[stat_col], 
-                marker_color=['#00ff96' if h else '#4a4a4a' for h in last_5['hit']]
-            ))
-            fig.add_hline(y=market_line, line_dash="dash", line_color="#ff4b4b", annotation_text="Line")
-            fig.update_layout(title="Last 5 Games vs Current Line", template="plotly_dark", height=300)
+            fig = go.Figure(go.Bar(x=[f"Wk {w}" for w in last_5['week']], y=last_5[stat_col], marker_color='#00ff96'))
+            fig.add_hline(y=market_line, line_dash="dash", line_color="#ff4b4b")
+            fig.update_layout(title="Recent Performance", template="plotly_dark", height=300)
             st.plotly_chart(fig, use_container_width=True)
 
     with c2:
         st.subheader("🚀 Smart Parlay Legs")
-        parlay_legs = generate_risk_parlay(
-            selected_p, p_pos, p_team, model_proj, p_std, 
-            selected_market, data, risk_pref, is_td_market
-        )
+        parlay_legs = generate_risk_parlay(selected_p, p_pos, p_team, model_proj, p_std, selected_market, data, risk_pref, is_td_market, selected_opp)
         for leg in parlay_legs:
-            st.info(f"🔹 **{leg['type']}**: {leg['label']}")
+            if leg.get('color') == "error":
+                st.error(f"⚠️ {leg['label']}")
+            else:
+                st.info(f"🔹 **{leg['type']}**: {leg['label']}")
             
         st.divider()
         st.subheader("🌦️ Weather Impact")
-        st.write(f"**Factor Summary**: {weather_reason}")
-        if not is_actually_indoor:
-            st.caption(f"Syncing live weather for outdoor venue: {sel_stad_name}")
+        st.write(f"**Factor Summary**: {w_reason}")
 else:
-    st.warning("⚠️ Data Initialization Error: Could not find player column in NFL data source. Please check the 'nflreadpy' library version.")
+    st.warning("⚠️ Data Initialization Error.")
