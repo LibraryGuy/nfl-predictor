@@ -8,7 +8,6 @@ from nfl_stadiums import NFLStadiums
 # --- 1. SETTINGS & API CONFIG ---
 st.set_page_config(page_title="NFL Sharp: Intelligence Hub", layout="wide", page_icon="🏈")
 
-# Your provided API Key
 API_KEY = "a77014ce7ac884a8102b4aabd0efe1e6"
 
 DEF_STATS_2025 = {
@@ -18,21 +17,34 @@ DEF_STATS_2025 = {
 }
 
 # --- API HELPER ---
-@st.cache_data(ttl=3600)
-def get_market_data(api_key, team_name):
-    """Fetches real-time market data for a specific team's game."""
+@st.cache_data(ttl=300) # 5-minute cache for live accuracy
+def get_market_data(api_key, team_abbr):
+    """Fetches real-time market data with fuzzy team matching."""
+    # Maps abbreviations to searchable city/team strings
+    team_map = {
+        'KC': 'Kansas City', 'GB': 'Green Bay', 'SF': 'San Francisco', 
+        'TB': 'Tampa Bay', 'NE': 'New England', 'NO': 'New Orleans', 
+        'LV': 'Las Vegas', 'LAC': 'Los Angeles Chargers', 'LAR': 'Los Angeles Rams',
+        'ARI': 'Arizona', 'ATL': 'Atlanta', 'BAL': 'Baltimore', 'BUF': 'Buffalo',
+        'CAR': 'Carolina', 'CHI': 'Chicago', 'CIN': 'Cincinnati', 'CLE': 'Cleveland',
+        'DAL': 'Dallas', 'DEN': 'Denver', 'DET': 'Detroit', 'HOU': 'Houston',
+        'IND': 'Indianapolis', 'JAX': 'Jacksonville', 'MIA': 'Miami', 'MIN': 'Minnesota',
+        'NYG': 'Giants', 'NYJ': 'Jets', 'PHI': 'Philadelphia', 'PIT': 'Pittsburgh',
+        'SEA': 'Seattle', 'TEN': 'Tennessee', 'WAS': 'Washington'
+    }
+    search_term = team_map.get(team_abbr, team_abbr).lower()
+
     try:
-        # We fetch all upcoming NFL totals to find the match for the selected team
         url = f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds/?apiKey={api_key}&regions=us&markets=totals&oddsFormat=american"
         response = requests.get(url, timeout=5)
         if response.status_code == 200:
             games = response.json()
-            # Find the game involving the selected team
             for game in games:
-                if team_name in game['home_team'] or team_name in game['away_team']:
+                if (search_term in game['home_team'].lower() or 
+                    search_term in game['away_team'].lower()):
                     return game
         return None
-    except Exception as e:
+    except Exception:
         return None
 
 @st.cache_data(ttl=3600)
@@ -63,11 +75,9 @@ if not data.empty:
         selected_p = st.selectbox("Select Player", sorted(data['player_name'].unique()))
         selected_opp = st.selectbox("Opponent Defense", sorted(data['opponent'].unique()))
         
-        # Get player team info
         p_team_row = data[data['player_name'] == selected_p]
         p_team = p_team_row['team'].iloc[-1] if not p_team_row.empty else "N/A"
         
-        # Matchup Logic
         matchup = schedules[((schedules['home_team'] == p_team) & (schedules['away_team'] == selected_opp)) | 
                            ((schedules['away_team'] == p_team) & (schedules['home_team'] == selected_opp))].iloc[-1:]
         
@@ -86,26 +96,27 @@ if not data.empty:
         st.divider()
         st.write("**💰 Market Sentiment**")
         
-        # Pull live data using the specific team
+        # Force Refresh Button
+        if st.button("🔄 Force Market Refresh"):
+            get_market_data.clear()
+            st.toast("Market Data Refreshed", icon="📡")
+
         live_game = get_market_data(API_KEY, p_team)
-        
-        # Default fallback values
         def_tickets, def_handle = 65, 45
         
         if live_game:
-            st.caption(f"✅ Live Odds Found: {live_game['home_team']} vs {live_game['away_team']}")
-            # Heuristic: If game total is higher than open, simulate Sharp Handle flow
-            # (Note: Standard API free tier gives odds, not direct handle %; we use odds movement to estimate)
-            def_tickets = 72 if v_total > 47 else 58
-            def_handle = 84 if v_total > 47 else 42
+            st.success(f"🏟️ Game Found: {live_game['home_team']} vs {live_game['away_team']}")
+            # Simulated Sharp/Public Split based on Total Line
+            def_tickets = 74 if v_total > 47 else 56
+            def_handle = 86 if v_total > 47 else 38
         else:
-            st.caption("⚠️ No live game found for this team. Using manual mode.")
+            st.warning(f"🔍 No live odds found for '{p_team}'.")
+            st.caption("Verify team abbreviation or game status.")
 
         ticket_pct = st.slider("% Public Tickets (Volume)", 0, 100, def_tickets)
         handle_pct = st.slider("% Sharp Handle (Dollars)", 0, 100, def_handle)
         
         game_script = st.select_slider("Expected Flow", options=["Defensive Struggle", "Balanced", "Shootout"], value=auto_script_val)
-        st.toast(f"Active Script: {game_script}", icon="🎭")
 
     # --- PERFORMANCE & PROJECTIONS ---
     p_df = data[data['player_name'] == selected_p].copy()
@@ -134,7 +145,6 @@ if not data.empty:
             fig_money.add_trace(go.Bar(name='Tickets (Public)', x=['Market Sentiment'], y=[ticket_pct], marker_color='#4a4a4a'))
             fig_money.add_trace(go.Bar(name='Handle (Sharps)', x=['Market Sentiment'], y=[handle_pct], marker_color='#00ff96'))
             
-            # Logic for the header message
             if handle_pct > ticket_pct + 10:
                 money_msg = "🔥 Significant Sharp Money Detected"
             elif ticket_pct > handle_pct + 15:
