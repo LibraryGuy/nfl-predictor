@@ -92,26 +92,16 @@ def get_weather_multiplier(roof_type, wind, temp, precip, p_pos):
 
 # --- 3. ADVANCED USAGE-BASED MONTE CARLO ENGINE ---
 def run_usage_monte_carlo(avg_volume, avg_efficiency, efficiency_std, matchup_mult, is_td, iterations=10000):
-    """
-    Simulates outcomes by decoupling Volume (targets/carries) from Efficiency (yards per).
-    """
     if avg_volume <= 0: return np.zeros(iterations)
     
     if is_td:
-        # For TDs, we still use Poisson based on the expected mean
         return np.random.poisson(avg_volume * matchup_mult, iterations)
     else:
-        # 1. Simulate Volume (Poisson distribution for discrete attempts/targets)
         sim_volume = np.random.poisson(avg_volume, iterations)
-        
-        # 2. Simulate Efficiency (Log-normal distribution for yards per attempt)
-        # We apply the matchup multiplier to the efficiency side
         adj_eff = avg_efficiency * matchup_mult
-        # Use a log-normal to ensure efficiency doesn't drop below 0 and has a long tail
-        sigma = 0.4 # Variance in efficiency
-        mu = np.log(adj_eff) - (sigma**2 / 2)
+        sigma = 0.4 
+        mu = np.log(max(adj_eff, 0.01)) - (sigma**2 / 2)
         sim_efficiency = np.random.lognormal(mu, sigma, iterations)
-        
         return sim_volume * sim_efficiency
 
 # --- PARLAY GENERATION ---
@@ -140,17 +130,47 @@ def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, d
     
     return parlay_legs
 
+# --- 4. IMPROVED DATA LOADING (FIX) ---
 @st.cache_data(ttl=3600)
 def load_data_pro():
+    """Fetches and normalizes NFL player stats to ensure column consistency."""
     try:
+        # nflreadpy returns Polars by default; convert to Pandas for processing
         df = nfl.load_player_stats(seasons=[2024, 2025]).to_pandas()
-        rename_map = {'player_display_name': 'player_name', 'recent_team': 'team', 'opponent_team': 'opponent'}
-        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
-        if 'player_name' not in df.columns and 'player' in df.columns:
-            df = df.rename(columns={'player': 'player_name'})
-        for col in ['passing_yards', 'rushing_yards', 'receiving_yards', 'attempts', 'carries', 'targets', 'passing_tds', 'rushing_tds', 'receiving_tds']:
-            df[col] = df.get(col, 0).fillna(0)
-        return df.dropna(subset=['player_name'])
+        
+        # --- COLUMN NORMALIZATION ---
+        # 1. Identify and rename the primary 'player_name' column
+        name_map = {'player_display_name': 'player_name', 'player': 'player_name'}
+        for old_col, new_col in name_map.items():
+            if old_col in df.columns and new_col not in df.columns:
+                df = df.rename(columns={old_col: new_col})
+        
+        # 2. Identify and rename team/opponent context
+        team_map = {'recent_team': 'team', 'opponent_team': 'opponent'}
+        df = df.rename(columns={k: v for k, v in team_map.items() if k in df.columns})
+        
+        # 3. Clean duplicate columns and fill missing stats
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+        
+        # Ensure all required columns exist and are numeric
+        required_stats = [
+            'passing_yards', 'rushing_yards', 'receiving_yards', 
+            'attempts', 'carries', 'targets', 
+            'passing_tds', 'rushing_tds', 'receiving_tds'
+        ]
+        for col in required_stats:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+            else:
+                df[col] = 0.0
+                
+        # Final safety check: drop rows without a player name
+        if 'player_name' in df.columns:
+            return df.dropna(subset=['player_name'])
+        else:
+            st.error("Column 'player_name' could not be found in source data.")
+            return pd.DataFrame()
+            
     except Exception as e:
         st.error(f"Sync Failure: {e}")
         return pd.DataFrame()
@@ -159,23 +179,22 @@ raw_data = load_data_pro()
 data = raw_data if isinstance(raw_data, pd.DataFrame) else pd.DataFrame()
 stadium_client = NFLStadiums()
 
-# --- UI ---
+# --- 5. UI & DASHBOARD ---
 if not data.empty and 'player_name' in data.columns:
     with st.sidebar:
         st.header("🎯 Target Selection")
         selected_p = st.selectbox("Select Player", sorted(data['player_name'].unique()))
-        selected_opp = st.selectbox("Opponent Defense", sorted(data['opponent'].unique()))
+        selected_opp = st.selectbox("Opponent Defense", sorted(data['opponent'].unique()) if 'opponent' in data.columns else ["N/A"])
         
         p_df = data[data['player_name'] == selected_p].copy()
-        p_pos = p_df['position'].iloc[-1]
-        p_team = p_df['team'].iloc[-1]
+        p_pos = p_df['position'].iloc[-1] if 'position' in p_df.columns else "WR"
+        p_team = p_df['team'].iloc[-1] if 'team' in p_df.columns else "N/A"
 
         selected_market = st.radio("Market Type", ["Yards", "Touchdowns"])
         is_td_market = selected_market == "Touchdowns"
         market_line = st.number_input("Sportsbook Line", value=0.5 if is_td_market else 50.0, step=0.5)
         risk_pref = st.radio("Target Odds Profile", ["Conservative (-104)", "Standard (+105)", "Aggressive (+200)"], index=1)
         
-        # Weather Logic
         sel_stad_name = st.selectbox("Game Venue", sorted(stadium_client.get_list_of_stadium_names()))
         game_time = st.time_input("Kickoff Time", time(13, 0))
         stad_obj = stadium_client.get_stadium_by_name(sel_stad_name)
@@ -189,39 +208,32 @@ if not data.empty and 'player_name' in data.columns:
         else:
             w_temp, w_wind, w_precip = 70, 0, "None"
 
-    # --- ENHANCED CALCULATION LOGIC ---
+    # --- CALCULATION LOGIC ---
     stat_col = ('passing_yards' if p_pos == 'QB' else 'rushing_yards' if p_pos == 'RB' else 'receiving_yards') if not is_td_market else ('passing_tds' if p_pos == 'QB' else 'rushing_tds' if p_pos == 'RB' else 'receiving_tds')
     volume_col = 'attempts' if p_pos == 'QB' else 'carries' if p_pos == 'RB' else 'targets'
     
-    avg_vol = p_df[volume_col].mean()
+    avg_vol = p_df[volume_col].mean() if volume_col in p_df.columns else 0
     
     if not is_td_market:
-        # Calculate Efficiency (Yards per target/carry/pass)
-        # We handle division by zero by using a small epsilon
         efficiency_series = p_df[stat_col] / p_df[volume_col].replace(0, np.nan)
         avg_eff = efficiency_series.dropna().mean() if not efficiency_series.dropna().empty else 0
         eff_std = efficiency_series.dropna().std() if len(efficiency_series.dropna()) > 1 else 0.2
     else:
-        avg_eff = 1.0 # Not used for TDs
-        eff_std = 0.0
+        avg_eff, eff_std = 1.0, 0.0
 
     w_mult, w_reason = get_weather_multiplier("Indoor" if is_actually_indoor else "Outdoor", w_wind, w_temp, w_precip, p_pos)
     m_ratio, m_status = get_matchup_context(data, selected_opp, p_pos, stat_col)
     
-    # Run the Usage-Based Simulation
-    # We apply weather to volume and matchup to efficiency
     sim_results = run_usage_monte_carlo(avg_vol * w_mult, avg_eff, eff_std, m_ratio, is_td_market)
-    
     sim_mean = np.mean(sim_results)
     win_prob = (np.sum(sim_results >= market_line) / 10000) * 100
 
-    # --- DASHBOARD ---
+    # --- DASHBOARD RENDERING ---
     st.title(f"📊 {selected_p} Intelligence Hub")
     c1, c2 = st.columns([2, 1])
     
     with c1:
         st.metric("Model Projection", f"{round(sim_mean, 1)} {selected_market}", f"Win Prob: {round(win_prob, 1)}%")
-        
         fig_dist = go.Figure()
         fig_dist.add_trace(go.Histogram(x=sim_results, nbinsx=50, marker_color='#00ff96', opacity=0.75))
         fig_dist.add_vline(x=market_line, line_dash="dash", line_color="#ff4b4b", annotation_text="Line")
@@ -237,4 +249,4 @@ if not data.empty and 'player_name' in data.columns:
         st.write(f"**Weather**: {w_reason}")
         st.write(f"**Matchup**: {m_status} ({m_ratio}x)")
 else:
-    st.warning("⚠️ Data Initialization Error.")
+    st.warning("⚠️ Data Initialization Error. Please check data source connection.")
