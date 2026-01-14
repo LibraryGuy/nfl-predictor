@@ -104,6 +104,37 @@ def run_usage_monte_carlo(avg_volume, avg_efficiency, efficiency_std, matchup_mu
         sim_efficiency = np.random.lognormal(mu, sigma, iterations)
         return sim_volume * sim_efficiency
 
+# --- 4. PROBABILITY LADDER GENERATOR ---
+def generate_prob_ladder(sim_results, is_td):
+    """Generates a table of hit percentages for various 'At Least' thresholds."""
+    if is_td:
+        thresholds = [1, 2, 3]
+        unit = "TDs"
+    else:
+        mean_val = np.mean(sim_results)
+        step = 25 if mean_val < 150 else 50
+        start = max(0, (mean_val // step) * step - step)
+        thresholds = [start + (i * step) for i in range(6)]
+        unit = "Yards"
+
+    ladder_data = []
+    for t in thresholds:
+        prob = (np.sum(sim_results >= t) / len(sim_results)) * 100
+        # Calculate American Odds: Positive for < 50% prob, Negative for > 50%
+        if prob > 0:
+            odds = int(100 / (prob / 100) - 100) if prob <= 50 else int(-(prob / (1 - prob / 100)))
+            odds_str = f"+{odds}" if odds > 0 else f"{odds}"
+        else:
+            odds_str = "N/A"
+            
+        ladder_data.append({
+            f"Threshold ({unit})": f"{int(t)}+",
+            "Hit Probability": f"{prob:.1f}%",
+            "Implied Odds": odds_str
+        })
+    
+    return pd.DataFrame(ladder_data)
+
 # --- PARLAY GENERATION ---
 def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, data, risk_level, is_td, opponent):
     risk_map = {
@@ -130,29 +161,18 @@ def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, d
     
     return parlay_legs
 
-# --- 4. IMPROVED DATA LOADING (FIX) ---
+# --- 5. IMPROVED DATA LOADING ---
 @st.cache_data(ttl=3600)
 def load_data_pro():
-    """Fetches and normalizes NFL player stats to ensure column consistency."""
     try:
-        # nflreadpy returns Polars by default; convert to Pandas for processing
         df = nfl.load_player_stats(seasons=[2024, 2025]).to_pandas()
-        
-        # --- COLUMN NORMALIZATION ---
-        # 1. Identify and rename the primary 'player_name' column
         name_map = {'player_display_name': 'player_name', 'player': 'player_name'}
         for old_col, new_col in name_map.items():
             if old_col in df.columns and new_col not in df.columns:
                 df = df.rename(columns={old_col: new_col})
-        
-        # 2. Identify and rename team/opponent context
         team_map = {'recent_team': 'team', 'opponent_team': 'opponent'}
         df = df.rename(columns={k: v for k, v in team_map.items() if k in df.columns})
-        
-        # 3. Clean duplicate columns and fill missing stats
         df = df.loc[:, ~df.columns.duplicated()].copy()
-        
-        # Ensure all required columns exist and are numeric
         required_stats = [
             'passing_yards', 'rushing_yards', 'receiving_yards', 
             'attempts', 'carries', 'targets', 
@@ -163,14 +183,10 @@ def load_data_pro():
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
             else:
                 df[col] = 0.0
-                
-        # Final safety check: drop rows without a player name
         if 'player_name' in df.columns:
             return df.dropna(subset=['player_name'])
         else:
-            st.error("Column 'player_name' could not be found in source data.")
             return pd.DataFrame()
-            
     except Exception as e:
         st.error(f"Sync Failure: {e}")
         return pd.DataFrame()
@@ -179,7 +195,7 @@ raw_data = load_data_pro()
 data = raw_data if isinstance(raw_data, pd.DataFrame) else pd.DataFrame()
 stadium_client = NFLStadiums()
 
-# --- 5. UI & DASHBOARD ---
+# --- 6. UI & DASHBOARD ---
 if not data.empty and 'player_name' in data.columns:
     with st.sidebar:
         st.header("🎯 Target Selection")
@@ -211,7 +227,6 @@ if not data.empty and 'player_name' in data.columns:
     # --- CALCULATION LOGIC ---
     stat_col = ('passing_yards' if p_pos == 'QB' else 'rushing_yards' if p_pos == 'RB' else 'receiving_yards') if not is_td_market else ('passing_tds' if p_pos == 'QB' else 'rushing_tds' if p_pos == 'RB' else 'receiving_tds')
     volume_col = 'attempts' if p_pos == 'QB' else 'carries' if p_pos == 'RB' else 'targets'
-    
     avg_vol = p_df[volume_col].mean() if volume_col in p_df.columns else 0
     
     if not is_td_market:
@@ -245,6 +260,14 @@ if not data.empty and 'player_name' in data.columns:
         parlay_legs = generate_risk_parlay(selected_p, p_pos, p_team, sim_mean, np.std(sim_results), selected_market, data, risk_pref, is_td_market, selected_opp)
         for leg in parlay_legs:
             st.info(f"🔹 **{leg['type']}**: {leg['label']}")
+        
+        st.divider()
+        
+        # --- PROBABILITY LADDER SECTION ---
+        st.subheader("📈 Probability Ladder")
+        ladder_df = generate_prob_ladder(sim_results, is_td_market)
+        st.table(ladder_df) 
+
         st.divider()
         st.write(f"**Weather**: {w_reason}")
         st.write(f"**Matchup**: {m_status} ({m_ratio}x)")
