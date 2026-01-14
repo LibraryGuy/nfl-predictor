@@ -1,9 +1,7 @@
 streamlit
-st-paywall
 nflreadpy
 pandas
-xgboost
-plotly
 numpy
-requests
-nfl-stadiums
+plotly
+scipy
+nfl_stadiums
