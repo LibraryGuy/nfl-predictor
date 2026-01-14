@@ -11,7 +11,7 @@ from nfl_stadiums import NFLStadiums
 # --- 1. SETTINGS & API CONFIG ---
 st.set_page_config(page_title="NFL Sharp: Intelligence Hub", layout="wide", page_icon="🏈")
 
-# --- INITIALIZE SESSION STATE KEYS ---
+# --- INITIALIZE SESSION STATE ---
 if "w_temp_val" not in st.session_state:
     st.session_state["w_temp_val"] = 70
 if "w_wind_val" not in st.session_state:
@@ -21,7 +21,6 @@ if "w_precip_val" not in st.session_state:
 if "last_stadium_query" not in st.session_state:
     st.session_state["last_stadium_query"] = ""
 
-# --- STADIUM OVERRIDES ---
 FORCE_OUTDOOR = [
     "Gillette Stadium", "Lumen Field", "Hard Rock Stadium", 
     "Acrisure Stadium", "GEHA Field at Arrowhead Stadium",
@@ -71,7 +70,6 @@ def fetch_stadium_weather(lat, lon, game_time):
     except Exception:
         return 70, 0, "None"
 
-# --- WEATHER IMPACT LOGIC ---
 def get_weather_multiplier(roof_type, wind, temp, precip, p_pos):
     if any(x in roof_type.lower() for x in ['dome', 'closed', 'indoor']):
         return 1.0, "Dome (No Impact)"
@@ -92,22 +90,31 @@ def get_weather_multiplier(roof_type, wind, temp, precip, p_pos):
         impact_reasons.append("Extreme Cold (-3%)")
     return round(multiplier, 2), (" + ".join(impact_reasons) if impact_reasons else "Fair Weather")
 
-# --- 3. MONTE CARLO ENGINE ---
-def run_monte_carlo(mean_val, std_val, is_td, iterations=10000):
-    """Generates 10,000 possible game outcomes."""
-    if mean_val <= 0: return np.zeros(iterations)
+# --- 3. ADVANCED USAGE-BASED MONTE CARLO ENGINE ---
+def run_usage_monte_carlo(avg_volume, avg_efficiency, efficiency_std, matchup_mult, is_td, iterations=10000):
+    """
+    Simulates outcomes by decoupling Volume (targets/carries) from Efficiency (yards per).
+    """
+    if avg_volume <= 0: return np.zeros(iterations)
     
     if is_td:
-        # Simulations for discrete events (TDs)
-        return np.random.poisson(mean_val, iterations)
+        # For TDs, we still use Poisson based on the expected mean
+        return np.random.poisson(avg_volume * matchup_mult, iterations)
     else:
-        # Yardage simulation using Log-Normal distribution
-        # This handles the skewness of NFL big plays better than Normal dist
-        sigma = np.sqrt(np.log(1 + (std_val**2 / mean_val**2)))
-        mu = np.log(mean_val) - (sigma**2 / 2)
-        return np.random.lognormal(mu, sigma, iterations)
+        # 1. Simulate Volume (Poisson distribution for discrete attempts/targets)
+        sim_volume = np.random.poisson(avg_volume, iterations)
+        
+        # 2. Simulate Efficiency (Log-normal distribution for yards per attempt)
+        # We apply the matchup multiplier to the efficiency side
+        adj_eff = avg_efficiency * matchup_mult
+        # Use a log-normal to ensure efficiency doesn't drop below 0 and has a long tail
+        sigma = 0.4 # Variance in efficiency
+        mu = np.log(adj_eff) - (sigma**2 / 2)
+        sim_efficiency = np.random.lognormal(mu, sigma, iterations)
+        
+        return sim_volume * sim_efficiency
 
-# --- PARLAY GENERATION LOGIC ---
+# --- PARLAY GENERATION ---
 def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, data, risk_level, is_td, opponent):
     risk_map = {
         "Conservative (-104)": {"offset": -0.6, "label": "Floor"},
@@ -115,7 +122,6 @@ def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, d
         "Aggressive (+200)": {"offset": 0.6, "label": "Ceiling"}
     }
     offset = risk_map[risk_level]["offset"]
-    
     stat_col = ('passing_yards' if p_pos == 'QB' else 'rushing_yards' if p_pos == 'RB' else 'receiving_yards') if not is_td else ('passing_tds' if p_pos == 'QB' else 'receiving_tds')
     m_ratio, m_status = get_matchup_context(data, opponent, p_pos, stat_col)
     
@@ -130,34 +136,10 @@ def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, d
         prob_zero = poisson.pmf(0, p_mean)
         market_name = "Passing TD" if p_pos == "QB" else "Anytime TD"
         if prob_zero > 0.58 or m_status == "Shutdown":
-            parlay_legs.append({
-                "label": f"AVOID: {selected_p} {market_name} (Def vs {p_pos}: {m_status})",
-                "type": "Risk Alert", "color": "error"
-            })
-    elif m_status == "Shutdown" and risk_level == "Aggressive (+200)":
-        parlay_legs.append({
-            "label": f"AVOID: {selected_p} {stat_label} (Top-Tier Def Matchup)",
-            "type": "Tough Matchup", "color": "error"
-        })
-
-    teammates = data[(data['team'] == p_team) & (data['player_name'] != selected_p)].sort_values(['season', 'week'], ascending=False)
-    if not teammates.empty:
-        latest_season = teammates['season'].max()
-        if p_pos == 'QB':
-            valid_targets = teammates[(teammates['season'] == latest_season) & (teammates['position'].isin(['WR', 'TE']))]
-            if not valid_targets.empty:
-                top_target = valid_targets.groupby('player_name')['receiving_yards'].sum().idxmax()
-                leg_val = 40 if risk_level == "Conservative (-104)" else 60
-                parlay_legs.append({"label": f"{top_target}: {leg_val}+ Rec Yds", "type": "Teammate Stack", "color": "info"})
-        elif p_pos in ['WR', 'TE', 'RB']:
-            current_qbs = teammates[(teammates['position'] == 'QB') & (teammates['season'] == latest_season)]
-            if not current_qbs.empty:
-                qb_name = current_qbs[current_qbs['week'] == current_qbs['week'].max()]['player_name'].iloc[0]
-                leg_val = 195 if risk_level == "Conservative (-104)" else 240
-                parlay_legs.append({"label": f"{qb_name}: {leg_val}+ Pass Yds", "type": "QB Link", "color": "info"})
+            parlay_legs.append({"label": f"AVOID: {selected_p} {market_name}", "type": "Risk Alert", "color": "error"})
+    
     return parlay_legs
 
-# --- 4. DATA LOADING ---
 @st.cache_data(ttl=3600)
 def load_data_pro():
     try:
@@ -166,8 +148,7 @@ def load_data_pro():
         df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
         if 'player_name' not in df.columns and 'player' in df.columns:
             df = df.rename(columns={'player': 'player_name'})
-        df = df.loc[:, ~df.columns.duplicated()].copy()
-        for col in ['passing_yards', 'rushing_yards', 'receiving_yards', 'receptions', 'passing_tds', 'rushing_tds', 'receiving_tds']:
+        for col in ['passing_yards', 'rushing_yards', 'receiving_yards', 'attempts', 'carries', 'targets', 'passing_tds', 'rushing_tds', 'receiving_tds']:
             df[col] = df.get(col, 0).fillna(0)
         return df.dropna(subset=['player_name'])
     except Exception as e:
@@ -178,106 +159,82 @@ raw_data = load_data_pro()
 data = raw_data if isinstance(raw_data, pd.DataFrame) else pd.DataFrame()
 stadium_client = NFLStadiums()
 
-# --- 5. UI RENDERING ---
+# --- UI ---
 if not data.empty and 'player_name' in data.columns:
     with st.sidebar:
         st.header("🎯 Target Selection")
         selected_p = st.selectbox("Select Player", sorted(data['player_name'].unique()))
-        opp_list = sorted(data['opponent'].unique()) if 'opponent' in data.columns else ["N/A"]
-        selected_opp = st.selectbox("Opponent Defense", opp_list)
+        selected_opp = st.selectbox("Opponent Defense", sorted(data['opponent'].unique()))
         
         p_df = data[data['player_name'] == selected_p].copy()
-        p_team = p_df['team'].iloc[-1] if not p_df.empty else "N/A"
-        p_pos = p_df['position'].iloc[-1] if not p_df.empty else "WR"
+        p_pos = p_df['position'].iloc[-1]
+        p_team = p_df['team'].iloc[-1]
 
         selected_market = st.radio("Market Type", ["Yards", "Touchdowns"])
-        stat_col = ('passing_yards' if p_pos == 'QB' else 'rushing_yards' if p_pos == 'RB' else 'receiving_yards') if selected_market == "Yards" else ('passing_tds' if p_pos == 'QB' else 'rushing_tds' if p_pos == 'RB' else 'receiving_tds')
-        is_td_market = "tds" in stat_col
+        is_td_market = selected_market == "Touchdowns"
         market_line = st.number_input("Sportsbook Line", value=0.5 if is_td_market else 50.0, step=0.5)
         risk_pref = st.radio("Target Odds Profile", ["Conservative (-104)", "Standard (+105)", "Aggressive (+200)"], index=1)
         
-        st.subheader("🏟️ Venue & Weather")
+        # Weather Logic
         sel_stad_name = st.selectbox("Game Venue", sorted(stadium_client.get_list_of_stadium_names()))
         game_time = st.time_input("Kickoff Time", time(13, 0))
-        
         stad_obj = stadium_client.get_stadium_by_name(sel_stad_name)
-        roof_type_raw = str(stad_obj.get('roof_type', 'Outdoor'))
+        roof_type = str(stad_obj.get('roof_type', 'Outdoor'))
         is_forced_outdoor = any(s.lower() in sel_stad_name.lower() for s in FORCE_OUTDOOR)
-        is_actually_indoor = any(x in roof_type_raw.lower() for x in ['dome', 'closed', 'indoor']) and not is_forced_outdoor
+        is_actually_indoor = any(x in roof_type.lower() for x in ['dome', 'closed', 'indoor']) and not is_forced_outdoor
 
-        if is_actually_indoor:
-            st.success(f"🏟️ Indoor: Conditions Controlled")
-            w_wind, w_temp, w_precip = 0, 70, "None"
+        if not is_actually_indoor:
+            lat, lon = (stad_obj.get('latitude'), stad_obj.get('longitude'))
+            w_temp, w_wind, w_precip = fetch_stadium_weather(lat, lon, game_time)
         else:
-            st.info(f"🏟️ Outdoor Venue: Weather Applied")
-            lat, lon = (stad_obj.get('latitude'), stad_obj.get('longitude')) if stad_obj else (None, None)
-            query_key = f"{sel_stad_name}_{game_time.hour}"
-            if st.session_state["last_stadium_query"] != query_key and lat and lon:
-                l_temp, l_wind, l_precip = fetch_stadium_weather(lat, lon, game_time)
-                st.session_state["w_temp_val"] = int(l_temp)
-                st.session_state["w_wind_val"] = int(l_wind)
-                st.session_state["w_precip_val"] = l_precip
-                st.session_state["last_stadium_query"] = query_key
-            w_temp = st.slider("Temp (F)", -10, 100, key="w_temp_val")
-            w_wind = st.slider("Wind (MPH)", 0, 40, key="w_wind_val")
-            p_opts = ["None", "Rain", "Snow"]
-            def_p_idx = p_opts.index(st.session_state.get("w_precip_val", "None"))
-            w_precip = st.selectbox("Precip", p_opts, index=def_p_idx)
+            w_temp, w_wind, w_precip = 70, 0, "None"
 
-    # --- CALCULATION (MONTE CARLO INTEGRATED) ---
-    p_mean = p_df[stat_col].mean()
-    p_std = p_df[stat_col].std() if len(p_df) > 1 else (p_mean * 0.4)
+    # --- ENHANCED CALCULATION LOGIC ---
+    stat_col = ('passing_yards' if p_pos == 'QB' else 'rushing_yards' if p_pos == 'RB' else 'receiving_yards') if not is_td_market else ('passing_tds' if p_pos == 'QB' else 'rushing_tds' if p_pos == 'RB' else 'receiving_tds')
+    volume_col = 'attempts' if p_pos == 'QB' else 'carries' if p_pos == 'RB' else 'targets'
+    
+    avg_vol = p_df[volume_col].mean()
+    
+    if not is_td_market:
+        # Calculate Efficiency (Yards per target/carry/pass)
+        # We handle division by zero by using a small epsilon
+        efficiency_series = p_df[stat_col] / p_df[volume_col].replace(0, np.nan)
+        avg_eff = efficiency_series.dropna().mean() if not efficiency_series.dropna().empty else 0
+        eff_std = efficiency_series.dropna().std() if len(efficiency_series.dropna()) > 1 else 0.2
+    else:
+        avg_eff = 1.0 # Not used for TDs
+        eff_std = 0.0
+
     w_mult, w_reason = get_weather_multiplier("Indoor" if is_actually_indoor else "Outdoor", w_wind, w_temp, w_precip, p_pos)
     m_ratio, m_status = get_matchup_context(data, selected_opp, p_pos, stat_col)
     
-    # Final adjusted mean used for simulation
-    sim_mean = p_mean * w_mult * m_ratio
+    # Run the Usage-Based Simulation
+    # We apply weather to volume and matchup to efficiency
+    sim_results = run_usage_monte_carlo(avg_vol * w_mult, avg_eff, eff_std, m_ratio, is_td_market)
     
-    # Run Simulation
-    sim_results = run_monte_carlo(sim_mean, p_std, is_td_market)
-    
-    # Calculate Win Probability based on Sims
-    win_count = np.sum(sim_results >= market_line)
-    win_prob = (win_count / 10000) * 100
+    sim_mean = np.mean(sim_results)
+    win_prob = (np.sum(sim_results >= market_line) / 10000) * 100
 
     # --- DASHBOARD ---
     st.title(f"📊 {selected_p} Intelligence Hub")
     c1, c2 = st.columns([2, 1])
     
     with c1:
-        st.metric("Model Projection", f"{round(sim_mean, 1)} {selected_market}", f"Win Prob: {round(win_prob, 1)}% (via 10k Sims)")
+        st.metric("Model Projection", f"{round(sim_mean, 1)} {selected_market}", f"Win Prob: {round(win_prob, 1)}%")
         
-        # PROBABILITY DISTRIBUTION CHART
         fig_dist = go.Figure()
-        fig_dist.add_trace(go.Histogram(
-            x=sim_results, 
-            nbinsx=50, 
-            name="Simulated Outcomes", 
-            marker_color='#00ff96',
-            opacity=0.75
-        ))
-        fig_dist.add_vline(x=market_line, line_dash="dash", line_color="#ff4b4b", annotation_text="Sportsbook Line")
-        fig_dist.update_layout(
-            title=f"Probability Distribution: {selected_market}",
-            xaxis_title=selected_market,
-            yaxis_title="Frequency (Out of 10,000 Games)",
-            template="plotly_dark", 
-            height=350
-        )
+        fig_dist.add_trace(go.Histogram(x=sim_results, nbinsx=50, marker_color='#00ff96', opacity=0.75))
+        fig_dist.add_vline(x=market_line, line_dash="dash", line_color="#ff4b4b", annotation_text="Line")
+        fig_dist.update_layout(title="Usage-Based Outcome Distribution", template="plotly_dark", height=350)
         st.plotly_chart(fig_dist, use_container_width=True)
 
     with c2:
         st.subheader("🚀 Smart Parlay Legs")
-        parlay_legs = generate_risk_parlay(selected_p, p_pos, p_team, sim_mean, p_std, selected_market, data, risk_pref, is_td_market, selected_opp)
+        parlay_legs = generate_risk_parlay(selected_p, p_pos, p_team, sim_mean, np.std(sim_results), selected_market, data, risk_pref, is_td_market, selected_opp)
         for leg in parlay_legs:
-            if leg.get('color') == "error":
-                st.error(f"⚠️ {leg['label']}")
-            else:
-                st.info(f"🔹 **{leg['type']}**: {leg['label']}")
-            
+            st.info(f"🔹 **{leg['type']}**: {leg['label']}")
         st.divider()
-        st.subheader("🌦️ Weather Impact")
-        st.write(f"**Factor Summary**: {w_reason}")
-        st.write(f"**Matchup Adjustment**: {m_status} ({m_ratio}x)")
+        st.write(f"**Weather**: {w_reason}")
+        st.write(f"**Matchup**: {m_status} ({m_ratio}x)")
 else:
     st.warning("⚠️ Data Initialization Error.")
