@@ -1,7 +1,10 @@
 streamlit
-nflreadpy
 pandas
 numpy
 plotly
 scipy
-nfl_stadiums
+nfl_data_py
+nflreadpy
+pytz
+requests
+nba_api
