@@ -1,10 +1,7 @@
-streamlit
+streamlit>=1.30.0
 pandas
 numpy
 plotly
 scipy
-nfl_data_py
 nflreadpy
 pytz
-requests
-nba_api
