@@ -104,9 +104,9 @@ def run_usage_monte_carlo(avg_volume, avg_efficiency, efficiency_std, matchup_mu
         sim_efficiency = np.random.lognormal(mu, sigma, iterations)
         return sim_volume * sim_efficiency
 
-# --- 4. PROBABILITY LADDER GENERATOR ---
+# --- 4. BULLETPROOF PROBABILITY LADDER GENERATOR ---
 def generate_prob_ladder(sim_results, is_td):
-    """Generates a table of hit percentages for various 'At Least' thresholds."""
+    """Generates a table of hit percentages for various 'At Least' thresholds with safety checks."""
     if is_td:
         thresholds = [1, 2, 3]
         unit = "TDs"
@@ -120,9 +120,19 @@ def generate_prob_ladder(sim_results, is_td):
     ladder_data = []
     for t in thresholds:
         prob = (np.sum(sim_results >= t) / len(sim_results)) * 100
-        # Calculate American Odds: Positive for < 50% prob, Negative for > 50%
+        
+        # --- BULLETPROOF ODDS LOGIC ---
         if prob > 0:
-            odds = int(100 / (prob / 100) - 100) if prob <= 50 else int(-(prob / (1 - prob / 100)))
+            # Clamp the probability between 0.01 and 99.99 to prevent ZeroDivision
+            safe_prob = max(min(prob, 99.99), 0.01)
+            
+            if safe_prob <= 50:
+                # Underdog Odds (+)
+                odds = int(100 / (safe_prob / 100) - 100)
+            else:
+                # Favorite Odds (-)
+                odds = int(-(safe_prob / (1 - safe_prob / 100)))
+            
             odds_str = f"+{odds}" if odds > 0 else f"{odds}"
         else:
             odds_str = "N/A"
@@ -198,7 +208,7 @@ stadium_client = NFLStadiums()
 # --- 6. UI & DASHBOARD ---
 if not data.empty and 'player_name' in data.columns:
     with st.sidebar:
-        st.header("🎯 Target Selection")
+        st.title("🏈 NFL Sharp: Intel")
         selected_p = st.selectbox("Select Player", sorted(data['player_name'].unique()))
         selected_opp = st.selectbox("Opponent Defense", sorted(data['opponent'].unique()) if 'opponent' in data.columns else ["N/A"])
         
