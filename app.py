@@ -3,130 +3,112 @@ import nflreadpy as nfl
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import requests
-from datetime import datetime, time
-from scipy.stats import norm, poisson
-from nfl_stadiums import NFLStadiums
+from scipy.stats import lognorm, poisson
 
-# --- 1. SETTINGS ---
-st.set_page_config(page_title="NFL Sharp: Intel", layout="wide")
-
-# --- 2. THE FIX: ROBUST DATA LOADING ---
+# --- 1. DATA RECOVERY & STANDARDIZATION ---
 @st.cache_data(ttl=3600)
-def load_and_standardize_nfl_data():
+def load_base_data():
     try:
-        # nflreadpy returns Polars; we MUST convert to Pandas immediately
-        raw_polars = nfl.load_player_stats(seasons=[2024, 2025])
-        df = raw_polars.to_pandas()
+        # Load 2024-2025 stats
+        df = nfl.load_player_stats(seasons=[2024, 2025]).to_pandas()
+        # Robust column mapping
+        mapping = {'player_display_name': 'player_name', 'recent_team': 'team', 'opponent_team': 'opponent'}
+        df = df.rename(columns={k: v for k, v in mapping.items() if k in df.columns})
         
-        if df.empty:
-            return pd.DataFrame()
-
-        # LOGIC: Aggressively look for name columns
-        # nflverse often uses 'player_display_name' or 'player_name'
-        possible_name_cols = ['player_display_name', 'player_name', 'player', 'name']
-        found_name = next((c for c in possible_name_cols if c in df.columns), None)
-        
-        if found_name:
-            df = df.rename(columns={found_name: 'player_name'})
-        else:
-            # If no name column is found, the data is likely corrupted or different schema
-            return df 
-
-        # Standardize other keys
-        df = df.rename(columns={
-            'recent_team': 'team', 
-            'opponent_team': 'opponent',
-            'position_group': 'position'
-        })
-        
-        # Numeric Safety
-        stat_cols = ['passing_yards', 'rushing_yards', 'receiving_yards', 'attempts', 'carries', 'targets', 'passing_tds', 'rushing_tds', 'receiving_tds']
-        for col in stat_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-            else:
-                df[col] = 0.0
-                
+        # Ensure numeric types for modeling
+        stats = ['passing_yards', 'rushing_yards', 'receiving_yards', 'passing_tds', 'rushing_tds', 'receiving_tds', 'attempts', 'targets']
+        for s in stats:
+            if s in df.columns:
+                df[s] = pd.to_numeric(df[s], errors='coerce').fillna(0)
         return df
     except Exception as e:
-        st.error(f"Critical Data Error: {e}")
+        st.error(f"Data Sync Failed: {e}")
         return pd.DataFrame()
 
-# Initialize
-data = load_and_standardize_nfl_data()
-stadiums = NFLStadiums()
-
-# --- 3. UI GUARD ---
-# This prevents the sorted() crash by checking if the column actually exists
-if not data.empty and 'player_name' in data.columns:
-    with st.sidebar:
-        st.title("🏈 Sharp Dashboard")
+# --- 2. THE ENGINE: MONTE CARLO SIMULATOR ---
+def run_advanced_simulation(player_stats, matchup_mult, weather_mult, market_type):
+    """
+    Runs 10,000 iterations using distribution curves tailored to NFL stat types.
+    """
+    iterations = 10000
+    
+    if "Yards" in market_type:
+        # Yards are modeled with Lognormal distribution (cannot be negative, right-skewed)
+        # We calculate the player's mean and variance (volatility)
+        mean_val = player_stats.mean() * matchup_mult * weather_mult
+        std_val = player_stats.std() if player_stats.std() > 0 else (mean_val * 0.4)
         
-        # Safe access to unique names
-        player_list = sorted(data['player_name'].dropna().unique())
-        selected_p = st.selectbox("Select Player", player_list)
+        # Convert to Lognormal parameters (mu and sigma)
+        sigma = np.sqrt(np.log(1 + (std_val**2 / (mean_val**2 + 1e-9))))
+        mu = np.log(mean_val + 1e-9) - (sigma**2 / 2)
         
-        p_df = data[data['player_name'] == selected_p].copy()
-        p_pos = p_df['position'].iloc[-1] if 'position' in p_df.columns else "WR"
-        
-        # Opponent Logic
-        opp_col = 'opponent' if 'opponent' in data.columns else 'team'
-        opponents = sorted(data[opp_col].unique())
-        selected_opp = st.selectbox("Versus Defense", opponents)
-        
-        market = st.radio("Market", ["Yards", "Touchdowns"])
-        is_td = market == "Touchdowns"
-        line = st.number_input("Line", value=0.5 if is_td else 50.0)
-        
-        venue_name = st.selectbox("Venue", sorted(stadiums.get_list_of_stadium_names()))
-        k_time = st.time_input("Kickoff", time(13, 0))
-
-    # --- 4. CALCULATION ENGINE ---
-    def run_sim(avg_v, avg_e, mult, td_mode):
-        if td_mode:
-            # Poisson for TDs (Drake Maye Fix)
-            lam = max(0.01, avg_e * mult)
-            return np.random.poisson(lam, 10000)
-        else:
-            # Lognormal for Yards
-            vol = np.random.poisson(max(avg_v, 1), 10000)
-            mu = np.log(max(avg_e * mult, 0.01)) - (0.4**2 / 2)
-            eff = np.random.lognormal(mu, 0.4, 10000)
-            return vol * eff
-
-    # Stat prep
-    if not is_td:
-        stat = 'passing_yards' if p_pos == 'QB' else ('rushing_yards' if p_pos == 'RB' else 'receiving_yards')
-        vol = 'attempts' if p_pos == 'QB' else ('carries' if p_pos == 'RB' else 'targets')
-        v_val, e_val = p_df[vol].mean(), (p_df[stat] / p_df[vol].replace(0, np.nan)).mean()
+        sims = np.random.lognormal(mu, sigma, iterations)
     else:
-        stat = 'passing_tds' if p_pos == 'QB' else ('rushing_tds' if p_pos == 'RB' else 'receiving_tds')
-        v_val, e_val = 1.0, p_df[stat].mean()
+        # Touchdowns are discrete events, modeled with Poisson
+        lam = max(0.01, player_stats.mean() * matchup_mult * weather_mult)
+        sims = np.random.poisson(lam, iterations)
+        
+    return sims
 
-    # Weather/Matchup (Simulated for brevity)
-    m_ratio = 1.05 if "Shutdown" not in selected_opp else 0.90
-    sims = run_sim(v_val, e_val, m_ratio, is_td)
-    win_p = (np.sum(sims >= line) / 10000) * 100
+# --- 3. UI & ANALYTICS ---
+data = load_base_data()
 
-    # UI Rendering
-    st.header(f"📊 {selected_p} Projections")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("Model Mean", f"{round(np.mean(sims), 2)} {market}", f"Win Prob: {round(win_p, 1)}%")
-        fig = go.Figure(go.Histogram(x=sims, marker_color='#22c55e'))
-        fig.add_vline(x=line, line_color="red")
-        st.plotly_chart(fig, use_container_width=True)
-    with col2:
-        st.subheader("Probability Ladder")
-        ladder = []
-        for t in ([0.5, 1.5, 2.5] if is_td else [25, 50, 75, 100]):
-            p = (np.sum(sims >= t) / 10000) * 100
-            ladder.append({"Target": f"{t}+", "Prob": f"{p:.1f}%"})
-        st.table(pd.DataFrame(ladder))
+if not data.empty:
+    st.sidebar.header("🔍 Intelligence Setup")
+    
+    # Selection Guard
+    all_players = sorted(data['player_name'].unique())
+    selected_player = st.sidebar.selectbox("Target Player", all_players)
+    
+    # Filter specific player data
+    p_df = data[data['player_name'] == selected_player].copy()
+    p_pos = p_df['position'].iloc[-1]
+    
+    # Market Logic
+    if p_pos == 'QB':
+        market = st.sidebar.selectbox("Market", ["Passing Yards", "Passing TDs"])
+        stat_col = 'passing_yards' if "Yards" in market else 'passing_tds'
+    elif p_pos == 'RB':
+        market = st.sidebar.selectbox("Market", ["Rushing Yards", "Rushing TDs"])
+        stat_col = 'rushing_yards' if "Yards" in market else 'rushing_tds'
+    else:
+        market = st.sidebar.selectbox("Market", ["Receiving Yards", "Receiving TDs"])
+        stat_col = 'receiving_yards' if "Yards" in market else 'receiving_tds'
+
+    line = st.sidebar.number_input("Sportsbook Line", value=50.0 if "Yards" in market else 0.5)
+
+    # Contextual Multipliers (In a production app, these pull from a DvP API)
+    st.sidebar.subheader("Adjustments")
+    matchup_adj = st.sidebar.slider("Matchup Strength (DvP)", 0.70, 1.30, 1.00, help="0.9 = Strong Defense, 1.1 = Weak Defense")
+    weather_adj = st.sidebar.slider("Weather Impact", 0.80, 1.00, 1.00, help="Wind/Rain reduction factor")
+
+    # --- EXECUTION ---
+    sim_results = run_advanced_simulation(p_df[stat_col], matchup_adj, weather_adj, market)
+    
+    # Probability Math
+    win_prob = (np.sum(sim_results > line) / 10000) * 100
+    expected_val = np.mean(sim_results)
+    edge = ((win_prob/100) * (1.91)) - 1 # Simple Edge calc for -110 odds
+
+    # Display Results
+    st.title(f"🏈 {selected_player} ({p_pos})")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Projected Mean", f"{expected_val:.1f}")
+    col2.metric("Win Probability", f"{win_prob:.1f}%")
+    col3.metric("Est. Edge", f"{edge*100:.1f}%", delta_color="normal")
+
+    # Visualization
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(x=sim_results, name='Simulated Outcomes', marker_color='#00f2ff', opacity=0.75))
+    fig.add_vline(x=line, line_dash="dash", line_color="red", annotation_text=f"Line: {line}")
+    fig.update_layout(title=f"10,000 Iteration Distribution: {market}", template="plotly_dark", xaxis_title=market)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Probability Ladder
+    st.subheader("🎯 Probability Ladder")
+    targets = [expected_val * 0.75, expected_val, expected_val * 1.25, expected_val * 1.5] if "Yards" in market else [0.5, 1.5, 2.5]
+    ladder = [{"Target": f"{round(t,1)}+", "Prob": f"{(np.sum(sim_results >= t)/10000)*100:.1f}%"} for t in targets]
+    st.table(pd.DataFrame(ladder))
 
 else:
-    st.error("### 🛑 Data Structure Mismatch")
-    st.write("The player name column was not found. Here is what the data looks like:")
-    st.write(data.head()) # This helps you debug which columns the API is actually sending
-    st.write("Available Columns:", data.columns.tolist() if not data.empty else "No columns found")
+    st.warning("Awaiting Data Stream...")
