@@ -11,7 +11,7 @@ from nfl_stadiums import NFLStadiums
 # --- 1. SETTINGS & API CONFIG ---
 st.set_page_config(page_title="NFL Sharp: Intelligence Hub", layout="wide", page_icon="🏈")
 
-# Initialize weather defaults if not present
+# Initialize session state for weather
 for key, val in {"w_temp_val": 70, "w_wind_val": 0, "w_precip_val": "None"}.items():
     if key not in st.session_state:
         st.session_state[key] = val
@@ -71,88 +71,107 @@ def get_weather_multiplier(roof, wind, temp, precip, pos):
         reasons.append(f"{precip} (-5%)")
     return round(mult, 2), (" + ".join(reasons) if reasons else "Clear")
 
-def run_usage_monte_carlo(avg_vol, avg_eff, eff_std, matchup_mult, is_td, iterations=10000):
+def run_usage_monte_carlo(avg_vol, avg_eff, matchup_mult, is_td, iterations=10000):
     if is_td:
-        # Corrected TD Logic: Discrete Poisson events
+        # TD Logic: Poisson Distribution (Events per game)
+        # avg_eff is the player's mean TDs per game
         td_lambda = max(0.01, avg_eff * matchup_mult)
         return np.random.poisson(td_lambda, iterations)
     else:
-        # Yardage: Continuous Lognormal distribution
+        # Yardage: Poisson Volume * Lognormal Efficiency
         sim_vol = np.random.poisson(max(avg_vol, 1), iterations)
         adj_eff = avg_eff * matchup_mult
+        # 0.4 sigma represents NFL yardage variance (Standard Deviation)
         mu = np.log(max(adj_eff, 0.01)) - (0.4**2 / 2)
         sim_eff = np.random.lognormal(mu, 0.4, iterations)
         return sim_vol * sim_eff
 
 def generate_prob_ladder(sims, is_td):
-    thresholds = [0.5, 1.5, 2.5] if is_td else [(np.mean(sims) // 25 * 25) + (i * 25) for i in range(-1, 5)]
+    if is_td:
+        thresholds = [0.5, 1.5, 2.5]
+    else:
+        m = np.mean(sims)
+        thresholds = [(m // 25 * 25) + (i * 25) for i in range(-1, 5)]
+    
     ladder = []
     for t in thresholds:
         if t < 0: continue
         prob = (np.sum(sims >= t) / len(sims)) * 100
         odds = "N/A"
         if 0.1 < prob < 99.9:
-            odds = f"+{int(100/(prob/100)-100)}" if prob <= 50 else f"{int(-(prob/(1-prob/100)))}"
+            if prob <= 50:
+                odds = f"+{int(100/(prob/100)-100)}"
+            else:
+                odds = f"{int(-(prob/(1-prob/100)))}"
         label = "Anytime TD" if is_td and t == 0.5 else f"{int(t)}+"
         ladder.append({"Threshold": label, "Probability": f"{prob:.1f}%", "Odds": odds})
     return pd.DataFrame(ladder)
 
-# --- 3. DATA LOADING & ROBUST COLUMN FIXING ---
+# --- 3. DATA LOADING (BULLETPROOF VERSION) ---
 @st.cache_data(ttl=3600)
 def load_and_fix_data():
     try:
-        df = nfl.load_player_stats(seasons=[2024, 2025]).to_pandas()
+        # Step 1: Load Raw Data
+        raw = nfl.load_player_stats(seasons=[2024, 2025]).to_pandas()
         
-        # Robust renaming map for consistency
-        rename_map = {
+        # Step 2: Aggressive Column Standardization
+        col_fixes = {
             'player_display_name': 'player_name',
             'player': 'player_name',
             'recent_team': 'team',
-            'opponent_team': 'opponent'
+            'opponent_team': 'opponent',
+            'tm': 'team',
+            'opp': 'opponent'
         }
-        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
-
-        if 'player_name' not in df.columns:
-            st.error("Could not locate player names. Check data source.")
+        
+        # Apply renaming
+        raw.columns = [col_fixes.get(c, c) for c in raw.columns]
+        
+        # Step 3: Verify Column existence
+        if 'player_name' not in raw.columns:
+            st.error(f"Critical Error: 'player_name' not found. Available columns: {raw.columns.tolist()}")
             return pd.DataFrame()
 
-        # Clean numeric stats
+        # Step 4: Numeric Cleanup
         stats = ['passing_yards', 'rushing_yards', 'receiving_yards', 'attempts', 'carries', 'targets', 
                  'passing_tds', 'rushing_tds', 'receiving_tds']
         for s in stats:
-            if s in df.columns:
-                df[s] = pd.to_numeric(df[s], errors='coerce').fillna(0)
+            if s in raw.columns:
+                raw[s] = pd.to_numeric(raw[s], errors='coerce').fillna(0)
+            else:
+                raw[s] = 0.0
         
-        return df.dropna(subset=['player_name'])
+        return raw.dropna(subset=['player_name'])
     except Exception as e:
-        st.error(f"Data Error: {e}")
+        st.error(f"Data Sync Failure: {str(e)}")
         return pd.DataFrame()
 
 data = load_and_fix_data()
 stadiums = NFLStadiums()
 
 # --- 4. DASHBOARD UI ---
-if not data.empty:
+if not data.empty and 'player_name' in data.columns:
     with st.sidebar:
         st.title("🏈 NFL Sharp: Intel")
-        # Fixing the selectbox crash with robust name column access
+        # Explicit bracket access to prevent AttributeErrors
         player_list = sorted(data['player_name'].unique())
         selected_p = st.selectbox("Select Player", player_list)
         
         p_df = data[data['player_name'] == selected_p].copy()
         p_pos = p_df['position'].iloc[-1] if 'position' in p_df.columns else "WR"
         
-        opponents = sorted(data['opponent'].unique())
-        selected_opp = st.selectbox("Opponent Defense", opponents)
+        # Handle team/opponent existence
+        opp_list = sorted(data['opponent'].unique()) if 'opponent' in data.columns else ["N/A"]
+        selected_opp = st.selectbox("Opponent Defense", opp_list)
         
-        market = st.radio("Market", ["Yards", "Touchdowns"])
+        market = st.radio("Market Select", ["Yards", "Touchdowns"])
         is_td = market == "Touchdowns"
         line = st.number_input("Sportsbook Line", value=0.5 if is_td else 50.0, step=0.5)
         
         venue = st.selectbox("Venue", sorted(stadiums.get_list_of_stadium_names()))
         k_time = st.time_input("Kickoff Time", time(13, 0))
         
-        # Weather Logic
+        # Weather Processing
         s_obj = stadiums.get_stadium_by_name(venue)
         roof = str(s_obj.get('roof_type', 'Outdoor'))
         if any(x in roof.lower() for x in ['dome', 'closed', 'indoor']) and venue not in FORCE_OUTDOOR:
@@ -162,31 +181,42 @@ if not data.empty:
 
     # --- STAT CALCULATIONS ---
     if not is_td:
+        # Yards logic
         stat_col = 'passing_yards' if p_pos == 'QB' else ('rushing_yards' if p_pos == 'RB' else 'receiving_yards')
         vol_col = 'attempts' if p_pos == 'QB' else ('carries' if p_pos == 'RB' else 'targets')
-        avg_v, avg_e = p_df[vol_col].mean(), (p_df[stat_col] / p_df[vol_col].replace(0, np.nan)).mean()
+        avg_v = p_df[vol_col].mean()
+        avg_e = (p_df[stat_col] / p_df[vol_col].replace(0, np.nan)).mean()
     else:
+        # TD logic (The Drake Maye Fix)
         stat_col = 'passing_tds' if p_pos == 'QB' else ('rushing_tds' if p_pos == 'RB' else 'receiving_tds')
-        avg_v, avg_e = 1.0, p_df[stat_col].mean()
+        avg_v = 1.0 # Set volume to 1 game
+        avg_e = p_df[stat_col].mean() # Mean TDs per game
 
     w_mult, w_text = get_weather_multiplier(roof, w_wind, w_temp, w_prec, p_pos)
     m_ratio, m_status = get_matchup_context(data, selected_opp, p_pos, stat_col)
     
-    sims = run_usage_monte_carlo(avg_v * w_mult, avg_e, 0.4, m_ratio, is_td)
+    # Run Simulation
+    sims = run_usage_monte_carlo(avg_v * w_mult, avg_e, m_ratio, is_td)
     win_p = (np.sum(sims >= line) / 10000) * 100
 
-    # UI Render
-    st.title(f"📊 {selected_p} ({p_pos})")
+    # UI Rendering
+    st.title(f"📊 {selected_p} Intelligence Hub")
     c1, c2 = st.columns([2, 1])
+    
     with c1:
-        st.metric("Projection", f"{round(np.mean(sims), 2)} {market}", f"Win Prob: {round(win_p, 1)}%")
-        fig = go.Figure(go.Histogram(x=sims, nbinsx=15 if is_td else 40, marker_color='#00ff96'))
-        fig.add_vline(x=line, line_dash="dash", line_color="red")
-        fig.update_layout(title="Probability Distribution", template="plotly_dark")
+        st.metric("Model Projection", f"{round(np.mean(sims), 2)} {market}", f"Win Prob: {round(win_p, 1)}%")
+        
+        fig = go.Figure(go.Histogram(x=sims, nbinsx=12 if is_td else 40, marker_color='#00ff96', opacity=0.7))
+        fig.add_vline(x=line, line_dash="dash", line_color="red", annotation_text="Line")
+        fig.update_layout(title=f"Predicted {market} Distribution", template="plotly_dark", height=400)
         st.plotly_chart(fig, use_container_width=True)
+
     with c2:
-        st.subheader("📈 Ladder")
+        st.subheader("📈 Probability Ladder")
         st.table(generate_prob_ladder(sims, is_td))
-        st.write(f"🌡️ {w_text} | 🛡️ {m_status} ({m_ratio}x)")
+        
+        st.divider()
+        st.write(f"🌡️ **Weather**: {w_text} ({w_temp}°F)")
+        st.write(f"🛡️ **Matchup**: {m_status} vs {selected_opp} ({m_ratio}x)")
 else:
-    st.error("No data available. Check your connection to nflverse.")
+    st.error("Data Load Error: The app could not find the player name column. Please refresh.")
