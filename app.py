@@ -5,103 +5,102 @@ import numpy as np
 import plotly.graph_objects as go
 from scipy.stats import poisson, lognorm
 
-# --- 1. THE REGISTRY (Lightweight Name Fetcher) ---
+# --- 1. THE REGISTRY (2025-2026 UPDATED) ---
 @st.cache_data(ttl=3600)
 def get_active_player_list():
-    """Loads only rosters to avoid memory crashes and column errors on boot."""
     try:
-        # Load 2024 rosters for the dropdown
-        roster = nfl.load_rosters(seasons=[2024]).to_pandas()
+        curr_season = nfl.get_current_season()
+        # load_players() is now the recommended source over load_rosters()
+        players = nfl.load_players().to_pandas()
         
-        # NFLVerse roster column is typically 'full_name' or 'player_name'
-        name_col = next((c for c in ['full_name', 'player_name', 'p_name'] if c in roster.columns), None)
+        # In 2025/2026, the key column is 'display_name' or 'short_name'
+        # We'll standardize it to 'player_name'
+        if 'display_name' in players.columns:
+            players = players.rename(columns={'display_name': 'player_name'})
         
-        if not name_col:
-            st.error(f"Roster Error: Name column not found. Available: {roster.columns.tolist()}")
-            return []
-            
-        # Filter for fantasy-relevant positions
-        skill_df = roster[roster['position'].isin(['QB', 'RB', 'WR', 'TE'])]
-        return sorted(skill_df[name_col].dropna().unique().tolist())
+        # Filter for active skill positions
+        active = players[players['position'].isin(['QB', 'RB', 'WR', 'TE'])]
+        return sorted(active['player_name'].dropna().unique().tolist())
     except Exception as e:
-        st.sidebar.error(f"Registry Sync Error: {e}")
-        return []
+        st.error(f"Registry Error: {e}")
+        return ["Patrick Mahomes", "Lamar Jackson", "Tyreek Hill"] # Fallbacks
 
-# --- 2. THE ANALYTICS ENGINE (Deep Data Loading) ---
+# --- 2. THE STATS LOADER (ON-DEMAND) ---
 @st.cache_data(ttl=3600)
 def get_player_deep_stats(player_name):
-    """Loads detailed game logs only for the chosen player."""
     try:
-        # Load stats for the prediction years
-        df = nfl.load_player_stats(seasons=[2024, 2025]).to_pandas()
+        curr_season = nfl.get_current_season()
+        # seasons=[curr_season] ensures we are looking at the RIGHT now.
+        # summary_level='week' is critical for game-by-game distribution
+        df = nfl.load_player_stats(seasons=[curr_season], summary_level='week').to_pandas()
         
-        # Standardize the player name column immediately
-        name_map = {'player_display_name': 'player_name', 'player': 'player_name'}
-        df = df.rename(columns={k: v for k, v in name_map.items() if k in df.columns})
+        # 2025 Column Mapping: nflreadpy now returns 'player_display_name'
+        rename_map = {'player_display_name': 'player_name', 'recent_team': 'team'}
+        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+        # Match the player
+        p_df = df[df['player_name'] == player_name].copy()
         
-        if 'player_name' not in df.columns:
-            return pd.DataFrame()
+        # If current season is empty (e.g. rookie hasn't played yet), try previous
+        if p_df.empty:
+            df_prev = nfl.load_player_stats(seasons=[curr_season-1], summary_level='week').to_pandas()
+            df_prev = df_prev.rename(columns={k: v for k, v in rename_map.items() if k in df_prev.columns})
+            p_df = df_prev[df_prev['player_name'] == player_name].copy()
             
-        return df[df['player_name'] == player_name].copy()
-    except Exception:
+        return p_df
+    except Exception as e:
+        st.sidebar.warning(f"Stat Fetch Error: {e}")
         return pd.DataFrame()
 
-# --- 3. THE PREDICTION LOGIC ---
-def run_monte_carlo(data_series, market_type, matchup_adj=1.0):
-    """Professional 10,000-iteration sim tailored to stat distributions."""
+# --- 3. THE ANALYTICS ENGINE ---
+def run_simulation(data_series, market):
     iterations = 10000
-    avg = data_series.mean() * matchup_adj
+    avg = data_series.mean()
+    if avg <= 0: return np.zeros(iterations) # Guard for no data
     
-    if "TD" in market_type:
-        # Poisson is best for discrete 'counting' events like Touchdowns
-        return np.random.poisson(max(avg, 0.01), iterations)
+    if "TD" in market:
+        return np.random.poisson(avg, iterations)
     else:
-        # Lognormal is best for yardage (avoids negatives, allows 'big play' outliers)
+        # Volatility check: if no variance, use a default 40% coefficient
         std = data_series.std() if data_series.std() > 0 else (avg * 0.4)
         sigma = np.sqrt(np.log(1 + (std**2 / (avg**2 + 1e-9))))
         mu = np.log(avg + 1e-9) - (sigma**2 / 2)
         return np.random.lognormal(mu, sigma, iterations)
 
-# --- 4. DASHBOARD UI ---
-st.set_page_config(page_title="NFL Sharp Predictor", layout="wide")
-st.sidebar.title("🏈 Sharp Intel")
-
+# --- 4. UI FLOW ---
+st.set_page_config(page_title="2026 NFL Sharp Predictor", layout="wide")
 player_list = get_active_player_list()
 selected_p = st.sidebar.selectbox("Select Player", player_list)
 
 if selected_p:
-    # LAZY LOAD: We only go get the heavy stats now
     p_data = get_player_deep_stats(selected_p)
     
     if not p_data.empty:
-        st.title(f"📊 {selected_p} Intelligence")
+        st.title(f"🚀 {selected_p} Predictor (2025-26 Season)")
         
-        # Dynamic Market Selection based on position
-        pos = p_data['position'].iloc[-1]
-        market_map = {
-            'QB': ['Passing Yards', 'Passing TDs'],
-            'RB': ['Rushing Yards', 'Rushing TDs'],
-            'WR': ['Receiving Yards', 'Receiving TDs'],
-            'TE': ['Receiving Yards', 'Receiving TDs']
-        }
-        market = st.sidebar.selectbox("Market", market_map.get(pos, ['Receiving Yards']))
-        stat_col = market.lower().replace(" ", "_")
-        line = st.sidebar.number_input("Sportsbook Line", value=0.5 if "TD" in market else 50.0)
+        # Position Detection
+        pos = p_data['position'].iloc[-1] if 'position' in p_data.columns else "WR"
+        
+        # Market Mapping
+        options = {'QB': ['passing_yards', 'passing_tds'], 
+                   'RB': ['rushing_yards', 'rushing_tds'],
+                   'WR': ['receiving_yards', 'receiving_tds']}
+        stat_col = st.sidebar.selectbox("Market", options.get(pos, ['receiving_yards']))
+        line = st.sidebar.number_input("Sportsbook Line", value=1.5 if "td" in stat_col else 45.5)
 
-        # Run Prediction
-        sims = run_monte_carlo(p_data[stat_col], market)
-        win_prob = (np.sum(sims > line) / 10000) * 100
+        # Modeling
+        sims = run_simulation(p_data[stat_col], stat_col)
+        win_p = (np.sum(sims >= line) / 10000) * 100
 
-        # Metrics
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Projected Mean", f"{np.mean(sims):.1f}")
-        c2.metric("Win Probability", f"{win_prob:.1f}%")
-        c3.metric("Volatility (StdDev)", f"{p_data[stat_col].std():.1f}")
-
-        # Visualization
-        fig = go.Figure(go.Histogram(x=sims, nbinsx=30, marker_color='#00ff96'))
-        fig.add_vline(x=line, line_dash="dash", line_color="red")
-        fig.update_layout(title=f"10,000 Iteration Result: {market}", template="plotly_dark")
-        st.plotly_chart(fig, use_container_width=True)
+        # Visuals
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            st.metric("Model Projection", f"{np.mean(sims):.1f} {stat_col.replace('_', ' ')}", f"Win Prob: {win_p:.1f}%")
+            fig = go.Figure(go.Histogram(x=sims, marker_color='#00ff96'))
+            fig.add_vline(x=line, line_color="red", line_dash="dash")
+            st.plotly_chart(fig, use_container_width=True)
+        with c2:
+            st.write("**Last 5 Games Raw Data**")
+            st.dataframe(p_data[['week', stat_col]].tail(5), hide_index=True)
     else:
-        st.error(f"Could not find historical stats for {selected_p} in 2024/2025.")
+        st.error(f"No 2025 or 2024 game stats found for {selected_p}. They may be inactive or a rookie with no games recorded.")
