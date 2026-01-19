@@ -18,8 +18,6 @@ if "w_wind_val" not in st.session_state:
     st.session_state["w_wind_val"] = 0
 if "w_precip_val" not in st.session_state:
     st.session_state["w_precip_val"] = "None"
-if "last_stadium_query" not in st.session_state:
-    st.session_state["last_stadium_query"] = ""
 
 FORCE_OUTDOOR = [
     "Gillette Stadium", "Lumen Field", "Hard Rock Stadium", 
@@ -90,25 +88,32 @@ def get_weather_multiplier(roof_type, wind, temp, precip, p_pos):
         impact_reasons.append("Extreme Cold (-3%)")
     return round(multiplier, 2), (" + ".join(impact_reasons) if impact_reasons else "Fair Weather")
 
-# --- 3. ADVANCED USAGE-BASED MONTE CARLO ENGINE ---
+# --- 3. REFACTORED MONTE CARLO ENGINE ---
 def run_usage_monte_carlo(avg_volume, avg_efficiency, efficiency_std, matchup_mult, is_td, iterations=10000):
-    if avg_volume <= 0: return np.zeros(iterations)
+    """
+    FIXED: Distinguishes between Yardage (Volume * Efficiency) and TDs (Poisson Events).
+    """
+    if avg_volume <= 0 and not is_td: return np.zeros(iterations)
     
     if is_td:
-        return np.random.poisson(avg_volume * matchup_mult, iterations)
+        # For TDs, avg_efficiency is actually 'Average TDs per Game'
+        # Matchup multiplier adjusts the expected frequency (lambda)
+        td_lambda = max(0.01, avg_efficiency * matchup_mult)
+        return np.random.poisson(td_lambda, iterations)
     else:
+        # For Yards, simulate volume (Poisson) and efficiency (Lognormal)
         sim_volume = np.random.poisson(avg_volume, iterations)
         adj_eff = avg_efficiency * matchup_mult
+        # Use lognormal to model 'Big Play' potential in yardage
         sigma = 0.4 
         mu = np.log(max(adj_eff, 0.01)) - (sigma**2 / 2)
         sim_efficiency = np.random.lognormal(mu, sigma, iterations)
         return sim_volume * sim_efficiency
 
-# --- 4. BULLETPROOF PROBABILITY LADDER GENERATOR ---
+# --- 4. ODDS & LADDER LOGIC ---
 def generate_prob_ladder(sim_results, is_td):
-    """Generates a table of hit percentages for various 'At Least' thresholds with safety checks."""
     if is_td:
-        thresholds = [1, 2, 3]
+        thresholds = [0.5, 1.5, 2.5]
         unit = "TDs"
     else:
         mean_val = np.mean(sim_results)
@@ -120,109 +125,66 @@ def generate_prob_ladder(sim_results, is_td):
     ladder_data = []
     for t in thresholds:
         prob = (np.sum(sim_results >= t) / len(sim_results)) * 100
-        
-        # --- BULLETPROOF ODDS LOGIC ---
-        if prob > 0:
-            # Clamp the probability between 0.01 and 99.99 to prevent ZeroDivision
-            safe_prob = max(min(prob, 99.99), 0.01)
-            
+        if 0 < prob < 100:
+            safe_prob = max(min(prob, 99.9), 0.1)
             if safe_prob <= 50:
-                # Underdog Odds (+)
                 odds = int(100 / (safe_prob / 100) - 100)
+                odds_str = f"+{odds}"
             else:
-                # Favorite Odds (-)
                 odds = int(-(safe_prob / (1 - safe_prob / 100)))
-            
-            odds_str = f"+{odds}" if odds > 0 else f"{odds}"
+                odds_str = f"{odds}"
         else:
             odds_str = "N/A"
             
+        label = f"Anytime" if is_td and t == 0.5 else f"{int(t)}+" if not is_td else f"{int(t+0.5)}+"
         ladder_data.append({
-            f"Threshold ({unit})": f"{int(t)}+",
+            f"Threshold ({unit})": label,
             "Hit Probability": f"{prob:.1f}%",
             "Implied Odds": odds_str
         })
-    
     return pd.DataFrame(ladder_data)
 
-# --- PARLAY GENERATION ---
-def generate_risk_parlay(selected_p, p_pos, p_team, p_mean, p_std, stat_label, data, risk_level, is_td, opponent):
-    risk_map = {
-        "Conservative (-104)": {"offset": -0.6, "label": "Floor"},
-        "Standard (+105)": {"offset": 0.0, "label": "Mean"},
-        "Aggressive (+200)": {"offset": 0.6, "label": "Ceiling"}
-    }
-    offset = risk_map[risk_level]["offset"]
-    stat_col = ('passing_yards' if p_pos == 'QB' else 'rushing_yards' if p_pos == 'RB' else 'receiving_yards') if not is_td else ('passing_tds' if p_pos == 'QB' else 'receiving_tds')
-    m_ratio, m_status = get_matchup_context(data, opponent, p_pos, stat_col)
-    
-    if is_td:
-        primary_val = 0.5 if risk_level != "Aggressive (+200)" else 1.5
-    else:
-        primary_val = max(0, round(p_mean + (offset * p_std)))
-    
-    parlay_legs = [{"label": f"{selected_p}: {primary_val}+ {stat_label}", "type": risk_map[risk_level]["label"], "color": "info"}]
-    
-    if is_td:
-        prob_zero = poisson.pmf(0, p_mean)
-        market_name = "Passing TD" if p_pos == "QB" else "Anytime TD"
-        if prob_zero > 0.58 or m_status == "Shutdown":
-            parlay_legs.append({"label": f"AVOID: {selected_p} {market_name}", "type": "Risk Alert", "color": "error"})
-    
-    return parlay_legs
-
-# --- 5. IMPROVED DATA LOADING ---
+# --- 5. DATA LOADING ---
 @st.cache_data(ttl=3600)
 def load_data_pro():
     try:
         df = nfl.load_player_stats(seasons=[2024, 2025]).to_pandas()
-        name_map = {'player_display_name': 'player_name', 'player': 'player_name'}
-        for old_col, new_col in name_map.items():
-            if old_col in df.columns and new_col not in df.columns:
-                df = df.rename(columns={old_col: new_col})
-        team_map = {'recent_team': 'team', 'opponent_team': 'opponent'}
-        df = df.rename(columns={k: v for k, v in team_map.items() if k in df.columns})
-        df = df.loc[:, ~df.columns.duplicated()].copy()
-        required_stats = [
-            'passing_yards', 'rushing_yards', 'receiving_yards', 
-            'attempts', 'carries', 'targets', 
-            'passing_tds', 'rushing_tds', 'receiving_tds'
-        ]
-        for col in required_stats:
+        # Standardization of column names for different nflreadpy versions
+        df = df.rename(columns={'player_display_name': 'player_name', 'recent_team': 'team', 'opponent_team': 'opponent'})
+        required = ['passing_yards', 'rushing_yards', 'receiving_yards', 'attempts', 'carries', 'targets', 'passing_tds', 'rushing_tds', 'receiving_tds']
+        for col in required:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-            else:
-                df[col] = 0.0
-        if 'player_name' in df.columns:
-            return df.dropna(subset=['player_name'])
-        else:
-            return pd.DataFrame()
+        return df.dropna(subset=['player_name'])
     except Exception as e:
-        st.error(f"Sync Failure: {e}")
+        st.error(f"Data Load Error: {e}")
         return pd.DataFrame()
 
 raw_data = load_data_pro()
-data = raw_data if isinstance(raw_data, pd.DataFrame) else pd.DataFrame()
 stadium_client = NFLStadiums()
 
 # --- 6. UI & DASHBOARD ---
-if not data.empty and 'player_name' in data.columns:
+if not raw_data.empty:
     with st.sidebar:
         st.title("🏈 NFL Sharp: Intel")
-        selected_p = st.selectbox("Select Player", sorted(data['player_name'].unique()))
-        selected_opp = st.selectbox("Opponent Defense", sorted(data['opponent'].unique()) if 'opponent' in data.columns else ["N/A"])
+        selected_p = st.selectbox("Select Player", sorted(raw_data['player_name'].unique()))
         
-        p_df = data[data['player_name'] == selected_p].copy()
+        p_df = raw_data[raw_data['player_name'] == selected_p].copy()
         p_pos = p_df['position'].iloc[-1] if 'position' in p_df.columns else "WR"
         p_team = p_df['team'].iloc[-1] if 'team' in p_df.columns else "N/A"
+        
+        opponents = sorted(raw_data['opponent'].unique())
+        selected_opp = st.selectbox("Opponent Defense", opponents)
 
         selected_market = st.radio("Market Type", ["Yards", "Touchdowns"])
         is_td_market = selected_market == "Touchdowns"
-        market_line = st.number_input("Sportsbook Line", value=0.5 if is_td_market else 50.0, step=0.5)
-        risk_pref = st.radio("Target Odds Profile", ["Conservative (-104)", "Standard (+105)", "Aggressive (+200)"], index=1)
+        
+        default_line = 0.5 if is_td_market else 50.0
+        market_line = st.number_input("Sportsbook Line", value=default_line, step=0.5)
         
         sel_stad_name = st.selectbox("Game Venue", sorted(stadium_client.get_list_of_stadium_names()))
         game_time = st.time_input("Kickoff Time", time(13, 0))
+        
         stad_obj = stadium_client.get_stadium_by_name(sel_stad_name)
         roof_type = str(stad_obj.get('roof_type', 'Outdoor'))
         is_forced_outdoor = any(s.lower() in sel_stad_name.lower() for s in FORCE_OUTDOOR)
@@ -234,52 +196,57 @@ if not data.empty and 'player_name' in data.columns:
         else:
             w_temp, w_wind, w_precip = 70, 0, "None"
 
-    # --- CALCULATION LOGIC ---
-    stat_col = ('passing_yards' if p_pos == 'QB' else 'rushing_yards' if p_pos == 'RB' else 'receiving_yards') if not is_td_market else ('passing_tds' if p_pos == 'QB' else 'rushing_tds' if p_pos == 'RB' else 'receiving_tds')
-    volume_col = 'attempts' if p_pos == 'QB' else 'carries' if p_pos == 'RB' else 'targets'
-    avg_vol = p_df[volume_col].mean() if volume_col in p_df.columns else 0
-    
+    # --- UPDATED CALCULATION LOGIC ---
     if not is_td_market:
-        efficiency_series = p_df[stat_col] / p_df[volume_col].replace(0, np.nan)
-        avg_eff = efficiency_series.dropna().mean() if not efficiency_series.dropna().empty else 0
-        eff_std = efficiency_series.dropna().std() if len(efficiency_series.dropna()) > 1 else 0.2
+        stat_col = 'passing_yards' if p_pos == 'QB' else ('rushing_yards' if p_pos == 'RB' else 'receiving_yards')
+        vol_col = 'attempts' if p_pos == 'QB' else ('carries' if p_pos == 'RB' else 'targets')
+        
+        avg_vol = p_df[vol_col].mean()
+        efficiency_series = p_df[stat_col] / p_df[vol_col].replace(0, np.nan)
+        avg_eff = efficiency_series.dropna().mean()
+        eff_std = efficiency_series.dropna().std() or 0.2
     else:
-        avg_eff, eff_std = 1.0, 0.0
+        # FIXED: TD Logic uses average TDs per game as the 'efficiency' and 1.0 as volume
+        stat_col = 'passing_tds' if p_pos == 'QB' else ('rushing_tds' if p_pos == 'RB' else 'receiving_tds')
+        avg_vol = 1.0
+        avg_eff = p_df[stat_col].mean()
+        eff_std = 0
 
     w_mult, w_reason = get_weather_multiplier("Indoor" if is_actually_indoor else "Outdoor", w_wind, w_temp, w_precip, p_pos)
-    m_ratio, m_status = get_matchup_context(data, selected_opp, p_pos, stat_col)
+    m_ratio, m_status = get_matchup_context(raw_data, selected_opp, p_pos, stat_col)
     
+    # Run Simulation
     sim_results = run_usage_monte_carlo(avg_vol * w_mult, avg_eff, eff_std, m_ratio, is_td_market)
     sim_mean = np.mean(sim_results)
     win_prob = (np.sum(sim_results >= market_line) / 10000) * 100
 
     # --- DASHBOARD RENDERING ---
-    st.title(f"📊 {selected_p} Intelligence Hub")
+    st.title(f"📊 {selected_p} Intelligence Hub ({p_pos})")
     c1, c2 = st.columns([2, 1])
     
     with c1:
-        st.metric("Model Projection", f"{round(sim_mean, 1)} {selected_market}", f"Win Prob: {round(win_prob, 1)}%")
+        st.metric("Model Projection", f"{round(sim_mean, 2)} {selected_market}", f"Win Prob: {round(win_prob, 1)}%")
+        
         fig_dist = go.Figure()
-        fig_dist.add_trace(go.Histogram(x=sim_results, nbinsx=50, marker_color='#00ff96', opacity=0.75))
+        fig_dist.add_trace(go.Histogram(x=sim_results, nbinsx=10 if is_td_market else 50, marker_color='#00ff96', opacity=0.75))
         fig_dist.add_vline(x=market_line, line_dash="dash", line_color="#ff4b4b", annotation_text="Line")
-        fig_dist.update_layout(title="Usage-Based Outcome Distribution", template="plotly_dark", height=350)
+        fig_dist.update_layout(title=f"Usage-Based {selected_market} Distribution", template="plotly_dark", height=400)
         st.plotly_chart(fig_dist, use_container_width=True)
 
     with c2:
-        st.subheader("🚀 Smart Parlay Legs")
-        parlay_legs = generate_risk_parlay(selected_p, p_pos, p_team, sim_mean, np.std(sim_results), selected_market, data, risk_pref, is_td_market, selected_opp)
-        for leg in parlay_legs:
-            st.info(f"🔹 **{leg['type']}**: {leg['label']}")
-        
-        st.divider()
-        
-        # --- PROBABILITY LADDER SECTION ---
         st.subheader("📈 Probability Ladder")
         ladder_df = generate_prob_ladder(sim_results, is_td_market)
         st.table(ladder_df) 
 
         st.divider()
-        st.write(f"**Weather**: {w_reason}")
-        st.write(f"**Matchup**: {m_status} ({m_ratio}x)")
+        st.write(f"🌡️ **Weather**: {w_reason} ({w_temp}°F, {w_wind}mph)")
+        st.write(f"🛡️ **Matchup**: {m_status} vs {selected_opp} ({m_ratio}x)")
+        
+        # Risk Insight
+        if is_td_market and win_prob < 30:
+            st.error("🚨 High Risk: Model shows low TD conversion probability.")
+        elif win_prob > 65:
+            st.success("✅ Strong Value: Model projects a high hit rate.")
+
 else:
     st.warning("⚠️ Data Initialization Error. Please check data source connection.")
