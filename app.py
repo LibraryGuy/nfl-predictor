@@ -9,19 +9,19 @@ from scipy.stats import poisson, lognorm
 # --- 1. DATA ACCESS & DEFENSIVE MODELING ---
 @st.cache_data(ttl=3600)
 def get_advanced_data():
-    """Loads stats from current and previous season to provide historical context."""
+    """Loads 6 seasons of data to ensure robust head-to-head history."""
     try:
         curr_season = nfl.get_current_season()
-        # Loading 2 years ensures we have head-to-head history for the table
-        seasons_to_load = [curr_season - 1, curr_season]
+        # Loading from 2020 to current (2025/26) captures true H2H trends
+        seasons_to_load = list(range(curr_season - 5, curr_season + 1))
         
         # Load player stats (weekly)
         raw_stats = nfl.load_player_stats(seasons=seasons_to_load, summary_level='week').to_pandas()
         
-        # Load team stats for Matchup Multipliers
+        # Load team stats for current season Matchup Multipliers
         team_stats = nfl.load_team_stats(seasons=[curr_season]).to_pandas()
         
-        # Create defensive lookup table (based on current season performance)
+        # Create defensive lookup table
         def_lookup = team_stats.groupby('team').mean(numeric_only=True)
         league_means = team_stats.mean(numeric_only=True)
         
@@ -55,7 +55,7 @@ def calculate_matchup_multiplier(opponent, stat_type, def_lookup, league_means):
     return 1.0
 
 # --- 3. UI & SIMULATION ---
-st.set_page_config(page_title="NFL Sharp Predictor v4", layout="wide")
+st.set_page_config(page_title="NFL Sharp Predictor v5", layout="wide")
 
 registry = get_registry()
 raw_stats, def_lookup, lg_means = get_advanced_data()
@@ -65,7 +65,6 @@ selected_label = st.sidebar.selectbox("Target Player", list(registry.keys()))
 player_id = registry[selected_label]
 
 if player_id and not raw_stats.empty:
-    # Filter for the specific player using ID
     p_df_all = raw_stats[raw_stats['player_id'] == player_id].copy()
     
     if not p_df_all.empty:
@@ -82,12 +81,10 @@ if player_id and not raw_stats.empty:
         teams = sorted(def_lookup.index.tolist())
         opp = st.sidebar.selectbox("Next Opponent", teams)
         
-        # --- MONTE CARLO ENGINE (Current Season Only for Form) ---
+        # --- MONTE CARLO ENGINE (Current Season Only for Projections) ---
         curr_season = nfl.get_current_season()
         p_df_curr = p_df_all[p_df_all['season'] == curr_season]
-        
-        # Fallback to previous season if they haven't played yet this year
-        model_data = p_df_curr if len(p_df_curr) > 2 else p_df_all
+        model_data = p_df_curr if len(p_df_curr) >= 3 else p_df_all
         
         match_mult = calculate_matchup_multiplier(opp, stat_col, def_lookup, lg_means)
         base_avg = model_data[stat_col].mean()
@@ -116,37 +113,44 @@ if player_id and not raw_stats.empty:
         fig_dist.update_layout(title=f"10,000 Iteration Forecast vs {opp}", template="plotly_dark")
         st.plotly_chart(fig_dist, use_container_width=True)
         
-        # --- NEW: RECENT FORM GRAPH (Last 5 Games Overall) ---
+        # --- PLAYER LAST 5 GAMES (Form Chart) ---
         st.divider()
-        st.subheader(f"📈 {selected_label}: Last 5 Games Form")
+        st.subheader(f"📈 {selected_label}: Recent Performance (Last 5 Games)")
         last_5_overall = p_df_all.sort_values(['season', 'week'], ascending=True).tail(5)
-        # Create a display string for the X-axis (Season + Week)
         last_5_overall['game_label'] = "S" + last_5_overall['season'].astype(str) + " W" + last_5_overall['week'].astype(str)
         
         fig_form = px.bar(
             last_5_overall, 
             x='game_label', 
             y=stat_col, 
-            text=stat_col,
             color=stat_col,
             color_continuous_scale='GnBu',
+            text_auto=True,
             labels={'game_label': 'Game', stat_col: stat_col.replace('_', ' ').title()}
         )
-        fig_form.update_layout(template="plotly_dark", height=350)
+        fig_form.update_layout(template="plotly_dark", height=400)
         st.plotly_chart(fig_form, use_container_width=True)
-
-        # --- NEW: HEAD-TO-HEAD HISTORY (Last 5 vs Specific Opponent) ---
-        st.subheader(f"🏟️ History vs {opp}")
-        h2h_df = p_df_all[p_df_all['opponent_team'] == opp].sort_values(['season', 'week'], ascending=False).head(5)
         
-        if not h2h_df.empty:
-            # Clean up column names for the table
-            table_df = h2h_df[['season', 'week', stat_col, 'completions', 'attempts', 'receptions', 'targets']].copy()
-            # Drop columns that are 0 or NaN for that position
-            table_df = table_df.dropna(axis=1, how='all')
-            st.table(table_df)
+
+        # --- HEAD-TO-HEAD HISTORY (All time vs Opponent up to 5) ---
+        st.subheader(f"🏟️ Historical Performance vs {opp}")
+        # Search the entire 6-season database for games against this specific opponent
+        h2h_all_time = p_df_all[p_df_all['opponent_team'] == opp].sort_values(['season', 'week'], ascending=False).head(5)
+        
+        if not h2h_all_time.empty:
+            st.write(f"Displaying the last {len(h2h_all_time)} matchups against the {opp}:")
+            cols_to_show = ['season', 'week', 'opponent_team', stat_col, 'completions', 'attempts', 'receptions', 'targets']
+            # Filter columns to only those that exist in the data (e.g., skip 'receptions' for QBs)
+            available_cols = [c for c in cols_to_show if c in h2h_all_time.columns]
+            
+            # Using dataframe for a cleaner, scrollable table
+            st.dataframe(
+                h2h_all_time[available_cols].rename(columns=lambda x: x.replace('_', ' ').title()),
+                use_container_width=True,
+                hide_index=True
+            )
         else:
-            st.info(f"No historical games found for {selected_label} against {opp} in the current dataset.")
+            st.info(f"No historical games found for {selected_label} against the {opp} in the current dataset (2020-2025).")
 
     else:
         st.warning(f"No game logs found for ID {player_id}.")
